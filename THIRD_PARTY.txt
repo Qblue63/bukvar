@@ -1,0 +1,12 @@
+Буквар използва следните свободни компоненти:
+
+Tesseract OCR и езиковите модели tessdata — Apache License 2.0
+  https://github.com/tesseract-ocr/tesseract
+Qt for Python (PySide6) — LGPL v3 (библиотеките са отделни DLL файлове и могат да се заменят)
+  https://www.qt.io/qt-for-python
+pypdfium2 / PDFium — Apache 2.0 / BSD-3-Clause
+pypdf — BSD-3-Clause; cryptography — Apache 2.0 / BSD (за криптирани PDF)
+python-docx — MIT
+Pillow — MIT-CMU (HPND)
+NumPy — BSD-3-Clause
+pytesseract — Apache 2.0
