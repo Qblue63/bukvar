@@ -42,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-r", "--recursive", action="store_true", help="обхожда и подпапките")
     ap.add_argument("--no-rotate", action="store_true", help="без автоматично завъртане")
     ap.add_argument("--no-deskew", action="store_true", help="без изправяне на наклона")
+    ap.add_argument("--no-forms", action="store_true",
+                    help="без обработка на формуляри (квадратчета ☐/☒, ръкопис, редове от точки)")
     ap.add_argument("-j", "--jobs", type=int, default=None, help="брой паралелни страници")
     ap.add_argument("--list-langs", action="store_true", help="показва наличните езици")
     ap.add_argument("--version", action="version", version=f"Буквар {__version__}")
@@ -84,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"\r[{n}/{len(files)}] {f.name}: страница {done[0]}/{len(pages)}", end="", flush=True)
 
             engine.process_pages(pages, args.lang, not args.no_rotate, not args.no_deskew,
-                                 workers=args.jobs, on_page_done=tick)
+                                 workers=args.jobs, clean_forms=not args.no_forms,
+                                 on_page_done=tick)
             target_dir = out_dir or f.parent
             for fmt in formats:
                 engine.export(pages, target_dir / f"{f.stem}.ocr.{fmt}")

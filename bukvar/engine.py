@@ -26,6 +26,7 @@ import pytesseract
 from PIL import Image, ImageOps
 from pypdf import PdfReader, PdfWriter, Transformation
 
+from .layout import clean_for_ocr
 from .textfix import fix_scripts
 
 RENDER_DPI = 300
@@ -286,42 +287,234 @@ def preprocess(page: Page, auto_rotate: bool = True, deskew: bool = True) -> Ima
 # Разпознаване
 # --------------------------------------------------------------------------
 
-def _build_paragraphs(data: dict) -> list[Paragraph]:
-    groups: dict[tuple, list[int]] = {}
+@dataclass
+class _Word:
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    conf: float
+
+    @property
+    def right(self) -> int:
+        return self.left + self.width
+
+    @property
+    def bottom(self) -> int:
+        return self.top + self.height
+
+
+@dataclass
+class _Line:
+    block: int
+    par: int
+    order: float
+    words: list[_Word]
+
+    @property
+    def left(self) -> int:
+        return min(w.left for w in self.words)
+
+    @property
+    def right(self) -> int:
+        return max(w.right for w in self.words)
+
+    @property
+    def top(self) -> int:
+        return min(w.top for w in self.words)
+
+    @property
+    def bottom(self) -> int:
+        return max(w.bottom for w in self.words)
+
+    @property
+    def height(self) -> float:
+        real = [w.height for w in self.words if w.conf >= 0]
+        return float(statistics.median(real or [w.height for w in self.words]))
+
+    def text(self) -> tuple[str, bool]:
+        """Текст на реда. Големите празнини (колони на формуляр) стават табулации."""
+        words = sorted(self.words, key=lambda w: w.left)
+        h = self.height
+        out, tabbed = words[0].text, False
+        for a, b in zip(words, words[1:]):
+            gap = b.left - a.right
+            if gap > 2.5 * h:
+                out += "\t" + b.text
+                tabbed = True
+            else:
+                out += " " + b.text
+        return out, tabbed
+
+
+_NUMBERED = re.compile(r"^(\d+(\.\d+)*\.?|[IVX]+\.|[а-яa-z]\)|[-•–—*])\s")
+_MARKS = ("☐", "☒", "[ръкопис]")
+_EXTRA_CONF = 100.0   # псевдодумите (☐ ☒ [ръкопис]) са сигурни
+
+
+def _collapse_marks(text: str) -> str:
+    text = re.sub(r"(\[ръкопис\][\s:.,]*){2,}", "[ръкопис] ", text).rstrip()
+    return text
+
+
+def _lines_from_tsv(data: dict) -> list[_Line]:
+    lines: dict[tuple, _Line] = {}
+    order = 0
     for i, word in enumerate(data["text"]):
-        if not word or not word.strip() or float(data["conf"][i]) < 0:
+        if not word or not word.strip() or data["conf"][i] < 0:
             continue
-        key = (data["block_num"][i], data["par_num"][i])
-        groups.setdefault(key, []).append(i)
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        if key not in lines:
+            lines[key] = _Line(key[0], key[1], float(order), [])
+            order += 1
+        lines[key].words.append(_Word(word, data["left"][i], data["top"][i],
+                                      data["width"][i], data["height"][i], data["conf"][i]))
+    return list(lines.values())
+
+
+def _drop_noise(lines: list[_Line]) -> list[_Line]:
+    """Маха остатъци от ръкопис/печати: думи с много ниска увереност."""
+    kept = []
+    for ln in lines:
+        def noise(w: _Word) -> bool:
+            if w.conf >= 30:
+                return False
+            alnum = sum(ch.isalnum() for ch in w.text)
+            # кодове и номера („30.ПП.00.МТ.11/7“) пазим дори при ниска увереност
+            if any(ch.isdigit() for ch in w.text) and alnum >= 3:
+                return False
+            return alnum <= 2 or alnum < len(w.text) / 2
+        ws = [w for w in ln.words if not noise(w)]
+        # ред само от препинателни знаци и черти („.....“, „| |“) — шум
+        if ws and any(ch.isalnum() for w in ws for ch in w.text):
+            ln.words = ws
+            kept.append(ln)
+    return kept
+
+
+def _merge_rows(lines: list[_Line]) -> list[_Line]:
+    """Кратки парчета текст вдясно на същия ред (колона „ДА / НЕ“ на формуляр)
+    се присъединяват към реда отляво. Дългите редове (истински колони) не пипаме."""
+    def short(ln: _Line) -> bool:
+        return len(ln.words) <= 3 and sum(len(w.text) for w in ln.words) <= 24
+
+    changed = True
+    while changed:
+        changed = False
+        for ln in sorted(lines, key=lambda l: -l.left):
+            if not short(ln):
+                continue
+            best = None
+            for other in lines:
+                if other is ln or other.right > ln.left + 5:
+                    continue
+                overlap = min(ln.bottom, other.bottom) - max(ln.top, other.top)
+                if overlap >= 0.5 * min(ln.bottom - ln.top, other.bottom - other.top):
+                    if best is None or other.right > best.right:
+                        best = other
+            if best is not None and (best.block != ln.block or best.par != ln.par):
+                best.words.extend(ln.words)
+                lines.remove(ln)
+                changed = True
+                break
+    return lines
+
+
+def _insert_extras(lines: list[_Line], extras) -> None:
+    for e in extras:
+        word = _Word(e.text, e.left, e.top, e.width, e.height, _EXTRA_CONF)
+        best, best_dist = None, None
+        for ln in lines:
+            pad = 0.35 * ln.height
+            if ln.top - pad <= e.cy <= ln.bottom + pad:
+                dist = 0 if ln.left <= e.cx <= ln.right else min(abs(e.cx - ln.left), abs(e.cx - ln.right))
+                if best is None or dist < best_dist:
+                    best, best_dist = ln, dist
+        if best is not None and best_dist < 1200:
+            best.words.append(word)
+            continue
+        # Самостоятелен ред: след най-близкия ред над него
+        above = [ln for ln in lines if ln.bottom <= e.cy]
+        if above:
+            ref = min(above, key=lambda ln: (e.cy - ln.bottom) + 0.2 * abs(e.cx - (ln.left + ln.right) / 2))
+            lines.append(_Line(ref.block, -1, ref.order + 0.5 + 0.001 * len(lines), [word]))
+        else:
+            lines.append(_Line(-1, -1, -1 + 0.001 * len(lines), [word]))
+
+
+def _build_paragraphs(lines: list[_Line]) -> list[Paragraph]:
+    lines = sorted(lines, key=lambda ln: ln.order)
+    if not lines:
+        return []
+    page_text = " ".join(w.text for ln in lines for w in ln.words)
+    # Дясната граница на текста в блока — за да познаем кратките (последни) редове
+    block_right: dict[int, int] = {}
+    for ln in lines:
+        block_right[ln.block] = max(block_right.get(ln.block, 0), ln.right)
 
     paragraphs: list[Paragraph] = []
-    for idxs in groups.values():
-        lines: dict[int, list[int]] = {}
-        for i in idxs:
-            lines.setdefault(data["line_num"][i], []).append(i)
-        line_texts, heights = [], []
-        for ln in sorted(lines):
-            ws = lines[ln]
-            line_texts.append(" ".join(data["text"][i] for i in ws))
-            heights.append(max(data["height"][i] for i in ws))
-        # Сливаме редовете; пренесените думи („пре-\nнос“) се съединяват.
-        text = ""
-        for lt in line_texts:
-            if text.endswith("-") and lt[:1].islower() and len(text) > 1 and text[-2].isalpha():
-                text = text[:-1] + lt
-            else:
-                text = f"{text} {lt}" if text else lt
-        paragraphs.append(Paragraph(text=fix_scripts(text), size=statistics.median(heights)))
+    cur_text, cur_heights, prev = "", [], None
+    prev_tabbed = False
+    paragraphs_text_tail = ""
 
-    if paragraphs:
-        body = statistics.median(p.size for p in paragraphs)
-        for p in paragraphs:
-            p.heading = p.size >= body * 1.45 and len(p.text) < 160
+    def flush():
+        nonlocal cur_text, cur_heights
+        if cur_text.strip():
+            paragraphs.append(Paragraph(text=cur_text.strip(), size=statistics.median(cur_heights)))
+        cur_text, cur_heights = "", []
+
+    for ln in lines:
+        text, tabbed = ln.text()
+        letters = sum(ch.isalpha() for ch in text)
+        # кратките редове („ДА ☐ HE ☒“, „Р-л c-p YC:“) нямат достатъчно букви —
+        # азбуката се определя по цялата страница
+        text = fix_scripts(text, None if letters >= 20 else page_text)
+        text = _collapse_marks(text)
+        h = ln.height
+        new_par = prev is None
+        if prev is not None:
+            ph = prev.height
+            prev_text = paragraphs_text_tail
+            continues = (abs(ln.left - prev.left) < 2 * ph and 0 <= ln.top - prev.bottom < 0.9 * ph
+                         and prev.right >= block_right[prev.block] - 4 * ph
+                         and prev_text[-1:] not in ".:;!?" and not _NUMBERED.match(text)
+                         and not tabbed and not prev_tabbed)
+            # ред, който започва с малка буква, продължава изречението отгоре
+            lower_cont = (text[:1].islower() and prev_text[-1:] not in ".:;!?"
+                          and not tabbed and not prev_tabbed
+                          and not any(m in prev_text for m in _MARKS)
+                          and 0 <= ln.top - prev.bottom < 1.8 * ph)
+            if lower_cont or (continues and (ln.block != prev.block or ln.par != prev.par)):
+                pass
+            elif (ln.block != prev.block or ln.par != prev.par
+                    or tabbed or prev_tabbed
+                    or any(m in prev_text for m in _MARKS)
+                    or _NUMBERED.match(text)
+                    or ln.top - prev.bottom > 1.2 * max(h, ph)
+                    or prev.right < block_right[prev.block] - 4 * ph
+                    or abs(h - ph) > 0.35 * max(h, ph)):
+                new_par = True
+        if new_par:
+            flush()
+            cur_text = text
+        elif cur_text.endswith("-") and text[:1].islower() and len(cur_text) > 1 and cur_text[-2].isalpha():
+            cur_text = cur_text[:-1] + text   # пренесена дума
+        else:
+            cur_text += " " + text
+        cur_heights.append(h)
+        prev, prev_tabbed = ln, tabbed
+        paragraphs_text_tail = text
+    flush()
+
+    body = statistics.median(p.size for p in paragraphs) if paragraphs else 0
+    for p in paragraphs:
+        p.heading = body > 0 and p.size >= body * 1.45 and len(p.text) < 160
     return paragraphs
 
 
 def _parse_tsv(tsv: str) -> dict:
-    cols = ["block_num", "par_num", "line_num", "height", "conf", "text"]
+    cols = ["block_num", "par_num", "line_num", "left", "top", "width", "height", "conf", "text"]
     data: dict[str, list] = {c: [] for c in cols}
     rows = tsv.splitlines()
     if not rows:
@@ -338,12 +531,20 @@ def _parse_tsv(tsv: str) -> dict:
     return data
 
 
-def ocr_page(page: Page, langs: str, img: Image.Image | None = None) -> None:
+def ocr_page(page: Page, langs: str, img: Image.Image | None = None,
+             clean_forms: bool = True) -> None:
     """Едно минаване на Tesseract дава и текстовия слой (PDF), и позициите (TSV)."""
+    img = img or page.image()
+    extras = []
+    if clean_forms:
+        cleaned = clean_for_ocr(img, RENDER_DPI)
+        ocr_img, extras = cleaned.image, cleaned.extras
+    else:
+        ocr_img = img
     with tempfile.TemporaryDirectory(prefix="bukvar_") as tmp:
         src = Path(tmp) / "page.png"
         base = Path(tmp) / "out"
-        (img or page.image()).save(src, dpi=(RENDER_DPI, RENDER_DPI))
+        ocr_img.save(src, dpi=(RENDER_DPI, RENDER_DPI))
         cmd = [pytesseract.pytesseract.tesseract_cmd, str(src), str(base),
                "-l", langs, "--psm", "3", "--dpi", str(RENDER_DPI),
                "-c", "textonly_pdf=1", "-c", "tessedit_create_pdf=1",
@@ -355,9 +556,11 @@ def ocr_page(page: Page, langs: str, img: Image.Image | None = None) -> None:
         data = _parse_tsv(base.with_suffix(".tsv").read_text(encoding="utf-8"))
         page.text_layer_pdf = base.with_suffix(".pdf").read_bytes()
 
-    page.paragraphs = _build_paragraphs(data)
+    lines = _merge_rows(_drop_noise(_lines_from_tsv(data)))
+    confs = [w.conf for ln in lines for w in ln.words]
+    _insert_extras(lines, extras)
+    page.paragraphs = _build_paragraphs(lines)
     page.text = "\n\n".join(p.text for p in page.paragraphs)
-    confs = [c for c, t in zip(data["conf"], data["text"]) if t.strip() and c >= 0]
     page.confidence = round(sum(confs) / len(confs), 1) if confs else None
     page.text_edited = False
     page.done = True
@@ -365,6 +568,7 @@ def ocr_page(page: Page, langs: str, img: Image.Image | None = None) -> None:
 
 def process_pages(pages: list[Page], langs: str, auto_rotate: bool = True,
                   deskew: bool = True, workers: int | None = None,
+                  clean_forms: bool = True,
                   on_page_done: Callable[[int], None] | None = None,
                   should_stop: Callable[[], bool] | None = None) -> None:
     """Обработва страниците паралелно. on_page_done(i) се вика за всяка готова."""
@@ -375,7 +579,7 @@ def process_pages(pages: list[Page], langs: str, auto_rotate: bool = True,
             return i
         try:
             img = preprocess(pages[i], auto_rotate, deskew)
-            ocr_page(pages[i], langs, img)
+            ocr_page(pages[i], langs, img, clean_forms)
             pages[i].error = None
         except Exception as exc:  # една лоша страница не спира останалите
             pages[i].error = str(exc)
@@ -450,6 +654,9 @@ def export_docx(pages: Iterable[Page], out_path: str | Path) -> None:
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
     normal.font.size = Pt(11)
+    normal.paragraph_format.space_after = Pt(3)
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.line_spacing = 1.0
     pages = list(pages)
     for n, page in enumerate(pages):
         for p in _page_paragraphs(page):

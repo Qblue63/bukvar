@@ -42,10 +42,10 @@ class OcrWorker(QObject):
     finished = Signal()
     failed = Signal(str)
 
-    def __init__(self, pages, indexes, langs, auto_rotate, deskew):
+    def __init__(self, pages, indexes, langs, auto_rotate, deskew, forms=True):
         super().__init__()
         self.pages, self.indexes = pages, indexes
-        self.langs, self.auto_rotate, self.deskew = langs, auto_rotate, deskew
+        self.langs, self.auto_rotate, self.deskew, self.forms = langs, auto_rotate, deskew, forms
         self._stop = threading.Event()
 
     def stop(self) -> None:
@@ -57,6 +57,7 @@ class OcrWorker(QObject):
             for p in subset:
                 p.reset()
             engine.process_pages(subset, self.langs, self.auto_rotate, self.deskew,
+                                 clean_forms=self.forms,
                                  on_page_done=lambda k: self.page_done.emit(self.indexes[k]),
                                  should_stop=self._stop.is_set)
         except Exception as exc:  # pragma: no cover - показва се на потребителя
@@ -255,7 +256,12 @@ class MainWindow(QMainWindow):
         self.act_rotate.setChecked(self.settings.value("auto_rotate", True, type=bool))
         self.act_deskew = QAction("Изправяне на наклона", self, checkable=True)
         self.act_deskew.setChecked(self.settings.value("deskew", True, type=bool))
-        self.opt_menu.addActions([self.act_rotate, self.act_deskew])
+        self.act_forms = QAction("Формуляри: квадратчета ☐/☒ и ръкопис", self, checkable=True)
+        self.act_forms.setChecked(self.settings.value("forms", True, type=bool))
+        self.act_forms.setToolTip("Разпознава квадратчетата за отметка, маха подписите и "
+                                  "ръкописа (синьо мастило) и редовете от точки.")
+        self.opt_menu.addActions([self.act_rotate, self.act_deskew, self.act_forms])
+        self.opt_menu.setToolTipsVisible(True)
         opt_btn = QToolButton()
         opt_btn.setText("Настройки")
         opt_btn.setPopupMode(QToolButton.InstantPopup)
@@ -439,6 +445,7 @@ class MainWindow(QMainWindow):
             return
         self.settings.setValue("auto_rotate", self.act_rotate.isChecked())
         self.settings.setValue("deskew", self.act_deskew.isChecked())
+        self.settings.setValue("forms", self.act_forms.isChecked())
         self._done_count, self._total = 0, len(indexes)
         self.progress.setRange(0, len(indexes))
         self.progress.setValue(0)
@@ -447,7 +454,8 @@ class MainWindow(QMainWindow):
 
         self._ocr_thread = QThread(self)
         self._ocr_worker = OcrWorker(self.pages, indexes, langs,
-                                     self.act_rotate.isChecked(), self.act_deskew.isChecked())
+                                     self.act_rotate.isChecked(), self.act_deskew.isChecked(),
+                                     self.act_forms.isChecked())
         self._ocr_worker.moveToThread(self._ocr_thread)
         self._ocr_thread.started.connect(self._ocr_worker.run)
         self._ocr_worker.page_done.connect(self._page_done)

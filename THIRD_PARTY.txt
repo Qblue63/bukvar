@@ -10,3 +10,4 @@ python-docx — MIT
 Pillow — MIT-CMU (HPND)
 NumPy — BSD-3-Clause
 pytesseract — Apache 2.0
+OpenCV (opencv-python-headless) — Apache 2.0

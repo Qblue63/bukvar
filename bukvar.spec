@@ -2,7 +2,7 @@
 # Tesseract се добавя в dist\Bukvar\tesseract от build.ps1.
 
 block_cipher = None
-excludes = ["tkinter", "matplotlib", "scipy", "pandas", "cv2", "IPython", "fontTools",
+excludes = ["tkinter", "matplotlib", "scipy", "pandas", "IPython", "fontTools",
             "PySide6.QtWebEngineCore", "PySide6.QtQml", "PySide6.QtQuick", "PySide6.Qt3DCore",
             "PySide6.QtMultimedia", "PySide6.QtNetwork", "PySide6.QtPdf", "PySide6.QtSvg"]
 datas = [("assets", "assets")]
