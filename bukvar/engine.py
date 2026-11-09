@@ -27,6 +27,7 @@ from PIL import Image, ImageOps
 from pypdf import PdfReader, PdfWriter, Transformation
 
 from .layout import clean_for_ocr
+from .style import classify, font_size_pt, is_serif, measure, smooth, snap_size
 from .textfix import fix_scripts
 
 RENDER_DPI = 300
@@ -100,11 +101,32 @@ def available_languages() -> list[str]:
 # --------------------------------------------------------------------------
 
 @dataclass
+class Run:
+    """Парче текст с еднакъв стил."""
+    text: str
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+
+
+@dataclass
 class Paragraph:
     text: str
     size: float          # средна височина на реда в пиксели
     heading: bool = False
     order: float = 0.0   # място в страницата (за подреждане спрямо таблиците)
+    # --- форматиране (за Word) ---
+    runs: list = field(default_factory=list)   # list[Run]; празно = само text
+    size_pt: float | None = None
+    align: str = "left"           # left | center | right | justify
+    indent_px: float = 0.0        # ляв отстъп от полето
+    first_px: float = 0.0         # отстъп на първия ред спрямо останалите
+    tabs: list = field(default_factory=list)   # [(позиция px от полето, left|center|right)]
+    frame: int = -1               # номер на рамката, в която е абзацът
+    border_top: bool = False      # разделителна линия над абзаца
+    space_before_pt: float = 0.0
+    top: int = 0
+    bottom: int = 0
 
 
 @dataclass
@@ -114,6 +136,10 @@ class TableCell:
     rowspan: int
     colspan: int
     text: str = ""
+    bold: bool = False
+    italic: bool = False
+    align: str = "left"
+    size_pt: float | None = None
 
 
 @dataclass
@@ -123,11 +149,16 @@ class TableBlock:
     cells: list[TableCell]
     col_widths: list[float]   # относителни ширини на колоните
     order: float = 0.0
+    left_px: int = 0           # положение и ширина в страницата (px)
+    width_px: int = 0
+    top: int = 0
+    bottom: int = 0
+    space_before_pt: float = 0.0
 
     def rows_text(self) -> list[list[str]]:
         grid = [["" for _ in range(self.n_cols)] for _ in range(self.n_rows)]
         for c in self.cells:
-            grid[c.row][c.col] = c.text
+            grid[c.row][c.col] = c.text.replace("\n", " ")
         return grid
 
     @property
@@ -174,6 +205,7 @@ class Page:
     paragraphs: list = field(default_factory=list)   # Paragraph | TableBlock
     text_layer_pdf: bytes | None = None   # невидим текстов слой
     confidence: float | None = None
+    geom: dict = field(default_factory=dict)   # полета, шрифт и размер — за Word
     text_edited: bool = False
     done: bool = False
     error: str | None = None
@@ -324,6 +356,7 @@ class _Word:
     width: int
     height: int
     conf: float
+    style: object = None   # style.WordStyle
 
     @property
     def right(self) -> int:
@@ -340,6 +373,8 @@ class _Line:
     par: int
     order: float
     words: list[_Word]
+    frame: int = -1
+    size_pt: float | None = None
 
     @property
     def left(self) -> int:
@@ -375,6 +410,21 @@ class _Line:
             else:
                 out += " " + b.text
         return out, tabbed
+
+    def segments(self) -> list[list[_Word]]:
+        """Части на реда, разделени с табулация."""
+        words = sorted(self.words, key=lambda w: w.left)
+        h = self.height
+        segs = [[words[0]]]
+        for a, b in zip(words, words[1:]):
+            if b.left - a.right > 2.5 * h:
+                segs.append([b])
+            else:
+                segs[-1].append(b)
+        return segs
+
+    def styles(self) -> list:
+        return [w.style for w in sorted(self.words, key=lambda w: w.left)]
 
 
 _NUMBERED = re.compile(r"^(\d+(\.\d+)*\.?|[IVX]+\.|[а-яa-z]\)|[-•–—*])\s")
@@ -478,9 +528,122 @@ def _insert_extras(lines: list[_Line], extras) -> None:
             lines.append(_Line(-1, -1, -1 + 0.001 * len(lines), [word]))
 
 
+def _style_key(st) -> tuple[bool, bool, bool]:
+    return (bool(st.bold), bool(st.italic), bool(st.underline)) if st is not None else (False, False, False)
+
+
+def _line_runs(text: str, styles: list) -> list[Run]:
+    """Разделя поправения текст на реда на парчета със стила на думите."""
+    parts = re.split(r"(\s+)", text)
+    words, seps = parts[0::2], parts[1::2]
+    keys = [_style_key(st) for st in styles]
+    if len(words) != len(keys) or not keys:
+        # броят на думите се е сменил (слети знаци и пр.) — стилът на мнозинството
+        if keys:
+            maj = tuple(sum(k[i] for k in keys) * 2 > len(keys) for i in range(3))
+        else:
+            maj = (False, False, False)
+        return [Run(text, *maj)]
+    runs: list[Run] = []
+
+    def add(t, key):
+        if runs and (runs[-1].bold, runs[-1].italic, runs[-1].underline) == key:
+            runs[-1].text += t
+        else:
+            runs.append(Run(t, *key))
+
+    for i, w in enumerate(words):
+        if i > 0:
+            a, b = keys[i - 1], keys[i]
+            add(seps[i - 1], tuple(x and y for x, y in zip(a, b)))
+        add(w, keys[i])
+    return runs
+
+
+def _join_runs(runs: list[Run], more: list[Run]) -> None:
+    """Добавя реда към абзаца: с интервал или слепвайки пренесена дума."""
+    if not more:
+        return
+    if not runs:
+        runs.extend(more)
+        return
+    last, first = runs[-1], more[0]
+    if (last.text.endswith("-") and first.text[:1].islower() and len(last.text) > 1
+            and last.text[-2].isalpha()):
+        last.text = last.text[:-1]
+    else:
+        key = tuple(x and y for x, y in zip((last.bold, last.italic, last.underline),
+                                            (first.bold, first.italic, first.underline)))
+        if (last.bold, last.italic, last.underline) == key:
+            last.text += " "
+        else:
+            runs.append(Run(" ", *key))
+    for r in more:
+        if runs and (runs[-1].bold, runs[-1].italic, runs[-1].underline) == (r.bold, r.italic, r.underline):
+            runs[-1].text += r.text
+        else:
+            runs.append(Run(r.text, r.bold, r.italic, r.underline))
+
+
+def _all_bold(ln: _Line) -> bool:
+    sts = [w.style for w in ln.words if w.style is not None and sum(c.isalpha() for c in w.text) >= 2]
+    return bool(sts) and sum(st.bold for st in sts) * 3 >= len(sts) * 2
+
+
+def _paragraph_geometry(par: Paragraph, plines: list[_Line], box) -> None:
+    par.top = min(ln.top for ln in plines)
+    par.bottom = max(ln.bottom for ln in plines)
+    sizes = [ln.size_pt for ln in plines if ln.size_pt]
+    par.size_pt = snap_size(statistics.median(sizes)) if sizes else None
+    if not box:
+        return
+    L, R = box
+    Wd = max(1.0, R - L)
+    mid = (L + R) / 2
+    lefts = [ln.left for ln in plines]
+    rights = [ln.right for ln in plines]
+    if len(plines) == 1 and "\t" in par.text:
+        segs = plines[0].segments()
+        par.indent_px = max(0.0, segs[0][0].left - L)
+        last = par.indent_px
+        for seg in segs[1:]:
+            sl = min(w.left for w in seg)
+            sr = max(w.right for w in seg)
+            if abs((sl + sr) / 2 - mid) < 0.04 * Wd:
+                tab = (mid - L, "center")
+            elif abs(sr - R) < 0.03 * Wd or sr > R:
+                tab = (max(sr, R) - L, "right")
+            else:
+                tab = (sl - L, "left")
+            if tab[0] > last + 5:
+                par.tabs.append(tab)
+                last = tab[0]
+        return
+    if len(plines) == 1:
+        left, right = lefts[0], rights[0]
+        if abs((left + right) / 2 - mid) < 0.04 * Wd and left - L > 0.08 * Wd:
+            par.align = "center"
+        elif abs(right - R) < 0.02 * Wd and left - L > 0.25 * Wd:
+            par.align = "right"
+        else:
+            par.indent_px = max(0.0, left - L)
+        return
+    centers = [(a + b) / 2 for a, b in zip(lefts, rights)]
+    if (all(abs(c - mid) < 0.04 * Wd for c in centers) and np.std(lefts) > 0.02 * Wd):
+        par.align = "center"
+        return
+    body_left = statistics.median(lefts[1:])
+    par.indent_px = max(0.0, body_left - L)
+    par.first_px = lefts[0] - body_left
+    full = rights[:-1]
+    if len(plines) >= 3 and max(full) - min(full) < 0.012 * Wd and max(full) >= R - 0.03 * Wd:
+        par.align = "justify"
+
+
 def _build_paragraphs(lines: list[_Line], breaks: list[float] = (),
-                      page_text: str | None = None) -> list[Paragraph]:
-    """breaks: места (order) на таблиците — абзац не може да ги прескача."""
+                      page_text: str | None = None, box=None) -> list[Paragraph]:
+    """breaks: места (order) на таблиците — абзац не може да ги прескача.
+    box: (ляво, дясно) поле на текста в страницата — за подравняването."""
     lines = sorted(lines, key=lambda ln: ln.order)
     if not lines:
         return []
@@ -492,17 +655,23 @@ def _build_paragraphs(lines: list[_Line], breaks: list[float] = (),
         block_right[ln.block] = max(block_right.get(ln.block, 0), ln.right)
 
     paragraphs: list[Paragraph] = []
-    cur_text, cur_heights, prev = "", [], None
+    cur_runs: list[Run] = []
+    cur_heights: list[float] = []
+    cur_lines: list[_Line] = []
+    prev = None
     cur_order = 0.0
     prev_tabbed = False
     paragraphs_text_tail = ""
 
     def flush():
-        nonlocal cur_text, cur_heights
-        if cur_text.strip():
-            paragraphs.append(Paragraph(text=cur_text.strip(), size=statistics.median(cur_heights),
-                                        order=cur_order))
-        cur_text, cur_heights = "", []
+        nonlocal cur_runs, cur_heights, cur_lines
+        text = "".join(r.text for r in cur_runs).strip()
+        if text:
+            par = Paragraph(text=text, size=statistics.median(cur_heights), order=cur_order,
+                            runs=cur_runs, frame=cur_lines[0].frame)
+            _paragraph_geometry(par, cur_lines, box)
+            paragraphs.append(par)
+        cur_runs, cur_heights, cur_lines = [], [], []
 
     for ln in lines:
         text, tabbed = ln.text()
@@ -511,6 +680,7 @@ def _build_paragraphs(lines: list[_Line], breaks: list[float] = (),
         # азбуката се определя по цялата страница
         text = fix_scripts(text, None if letters >= 20 else page_text)
         text = _collapse_marks(text)
+        runs = _line_runs(text, ln.styles())
         h = ln.height
         new_par = prev is None
         if prev is not None:
@@ -526,12 +696,17 @@ def _build_paragraphs(lines: list[_Line], breaks: list[float] = (),
                           and not any(m in prev_text for m in _MARKS)
                           and 0 <= ln.top - prev.bottom < 1.8 * ph)
             table_between = any(prev.order < b < ln.order for b in breaks)
-            if table_between:
+            style_change = _all_bold(prev) != _all_bold(ln)
+            # отместен/центриран ред, следван от ред, започващ другаде — нов абзац
+            shifted = (box is not None and abs(ln.left - prev.left) > 3 * ph
+                       and prev.left > box[0] + 0.08 * (box[1] - box[0]) and not lower_cont)
+            if table_between or ln.frame != prev.frame or shifted:
                 new_par = True
-            elif lower_cont or (continues and (ln.block != prev.block or ln.par != prev.par)):
+            elif lower_cont or (continues and not style_change and (ln.block != prev.block or ln.par != prev.par)):
                 pass
             elif (ln.block != prev.block or ln.par != prev.par
                     or tabbed or prev_tabbed
+                    or style_change
                     or any(m in prev_text for m in _MARKS)
                     or _NUMBERED.match(text)
                     or ln.top - prev.bottom > 1.2 * max(h, ph)
@@ -540,13 +715,10 @@ def _build_paragraphs(lines: list[_Line], breaks: list[float] = (),
                 new_par = True
         if new_par:
             flush()
-            cur_text = text
             cur_order = ln.order
-        elif cur_text.endswith("-") and text[:1].islower() and len(cur_text) > 1 and cur_text[-2].isalpha():
-            cur_text = cur_text[:-1] + text   # пренесена дума
-        else:
-            cur_text += " " + text
+        _join_runs(cur_runs, runs)
         cur_heights.append(h)
+        cur_lines.append(ln)
         prev, prev_tabbed = ln, tabbed
         paragraphs_text_tail = text
     flush()
@@ -557,7 +729,7 @@ def _build_paragraphs(lines: list[_Line], breaks: list[float] = (),
     return paragraphs
 
 
-def _cell_text(words: list[_Word], page_text: str) -> str:
+def _cell_text(words: list[_Word], page_text: str, rect=None) -> str:
     """Текст на клетка: думите по редове, редовете слети в едно изречение."""
     if not words:
         return ""
@@ -574,12 +746,21 @@ def _cell_text(words: list[_Word], page_text: str) -> str:
         else:
             rows.append([w])
     out = ""
+    prev_row = None
     for row in rows:
         t = " ".join(w.text for w in sorted(row, key=lambda w: w.left))
+        # Ред, който свършва далеч преди десния край на клетката (заглавие,
+        # „МЕТОДИКА“ над подзаглавие), остава на отделен ред.
+        early = (rect is not None and prev_row is not None
+                 and rect[2] - max(w.right for w in prev_row) > 0.25 * (rect[2] - rect[0])
+                 and not t[:1].islower())
         if out.endswith("-") and t[:1].islower() and len(out) > 1 and out[-2].isalpha():
             out = out[:-1] + t
+        elif early:
+            out = f"{out}\n{t}"
         else:
             out = f"{out} {t}" if out else t
+        prev_row = row
     letters = sum(ch.isalpha() for ch in out)
     out = fix_scripts(out, None if letters >= 20 else page_text)
     # заглавие на колона „№“ често се чете като „Ло“, „No“, „Хо“
@@ -647,6 +828,26 @@ def _split_borderless_columns(grid, words: list[_Word], dpi: int) -> None:
             break
 
 
+def _cell_format(cell: TableCell, words: list[_Word], rect) -> None:
+    styled = [w for w in words if w.style is not None and sum(c.isalpha() for c in w.text) >= 2]
+    if styled:
+        n = sum(len(w.text) for w in styled)
+        cell.bold = sum(len(w.text) for w in styled if w.style.bold) * 5 >= n * 3
+        cell.italic = sum(len(w.text) for w in styled if w.style.italic) * 5 >= n * 3
+        ems = [w.style.em for w in styled if w.style.em]
+        if ems:
+            cell.size_pt = snap_size(font_size_pt(statistics.median(ems) * 0.70, RENDER_DPI))
+    if words:
+        x0, _, x1, _ = rect
+        left = min(w.left for w in words)
+        right = max(w.right for w in words)
+        cw = max(1, x1 - x0)
+        if abs((left + right) / 2 - (x0 + x1) / 2) < 0.08 * cw and left - x0 > 0.15 * cw:
+            cell.align = "center"
+        elif x1 - right < 0.08 * cw and left - x0 > 0.4 * cw:
+            cell.align = "right"
+
+
 def _build_tables(grids, lines: list[_Line], extras, page_text: str, dpi: int,
                   cell_words: list[list[_Word]] | None = None):
     """Изважда думите в таблиците от редовете и прави TableBlock-ове."""
@@ -695,15 +896,22 @@ def _build_tables(grids, lines: list[_Line], extras, page_text: str, dpi: int,
             cell = g.cell_at(w.left + w.width / 2, w.top + w.height / 2)
             if cell is not None:
                 by_cell[cell].append(w)
-        cells = [TableCell(r0, c0, r1 - r0 + 1, c1 - c0 + 1, _cell_text(by_cell[(r0, c0, r1, c1)], page_text))
-                 for (r0, c0, r1, c1) in g.cells]
+        cells = []
+        for (r0, c0, r1, c1) in g.cells:
+            ws = by_cell[(r0, c0, r1, c1)]
+            cell = TableCell(r0, c0, r1 - r0 + 1, c1 - c0 + 1,
+                             _cell_text(ws, page_text, g.cell_rect((r0, c0, r1, c1))))
+            _cell_format(cell, ws, g.cell_rect((r0, c0, r1, c1)))
+            cells.append(cell)
         total = g.xs[-1] - g.xs[0]
         widths = [(g.xs[j + 1] - g.xs[j]) / total for j in range(len(g.xs) - 1)]
         # място в текста: след последния ред над таблицата
         top = g.ys[0]
         above = [ln.order for ln in rest_lines if ln.bottom <= top + 5]
         order = (max(above) if above else -1.0) + 0.5
-        blocks.append(TableBlock(len(g.ys) - 1, len(g.xs) - 1, cells, widths, order))
+        blocks.append(TableBlock(len(g.ys) - 1, len(g.xs) - 1, cells, widths, order,
+                                 left_px=g.xs[0], width_px=g.xs[-1] - g.xs[0],
+                                 top=g.ys[0], bottom=g.ys[-1]))
     # две таблици на едно и също място — запазваме реда им отгоре надолу
     for k, b in enumerate(blocks):
         b.order += 0.001 * k
@@ -829,23 +1037,165 @@ def _ocr_table_cells(img: Image.Image, grids, langs: str) -> list[list[_Word]]:
     return words
 
 
+def _measure_styles(lines: list[_Line], cell_words: list[list[_Word]], gray: np.ndarray,
+                    thr: float) -> None:
+    """Стил на всяка дума (удебелен/курсив/размер) и размер на шрифта на редовете."""
+    # Размерът се мери по редове (в таблицата — по редове на таблицата),
+    # а стилът се изглажда по редове на текста и по клетки.
+    size_groups: list[list[_Word]] = [ln.words for ln in lines]
+    style_groups: list[list[_Word]] = [ln.words for ln in lines]
+    for ws in cell_words:
+        ws = sorted(ws, key=lambda w: w.top + w.height / 2)
+        rows: list[list[_Word]] = []
+        for w in ws:
+            if rows and abs((w.top + w.height / 2) - (rows[-1][-1].top + rows[-1][-1].height / 2)) <= 0.5 * w.height:
+                rows[-1].append(w)
+            else:
+                rows.append([w])
+        for row in rows:
+            row.sort(key=lambda w: w.left)
+            size_groups.append(row)
+            cur = [row[0]]
+            for a, b in zip(row, row[1:]):
+                if b.left - a.right > 1.5 * max(a.height, b.height):   # друга клетка
+                    style_groups.append(cur)
+                    cur = []
+                cur.append(b)
+            style_groups.append(cur)
+    all_styles, all_ems = [], []
+    group_caps = []
+    for g in size_groups:
+        caps = []
+        for w in g:
+            if w.conf >= _EXTRA_CONF and w.text in _MARKS:
+                continue
+            w.style = measure(gray, w.left, w.top, w.width, w.height, w.text, thr)
+            if w.style.cap:
+                caps.append(w.style.cap)
+        group_caps.append(statistics.median(caps) if caps else None)
+    known = [c for c in group_caps if c]
+    page_cap = statistics.median(known) if known else 0.1 * RENDER_DPI
+    for g, cap in zip(size_groups, group_caps):
+        em = (cap or page_cap) / 0.70
+        for w in g:
+            if w.style is not None:
+                w.style.em = em
+                all_styles.append(w.style)
+                all_ems.append(em)
+    classify(all_styles, all_ems)
+    for g in style_groups:
+        ordered = [w for w in sorted(g, key=lambda w: w.left) if w.style is not None]
+        lens = [len(w.text) for w in ordered]
+        # удебеляването обикновено е на цели редове; курсивът — често на фрази
+        for attr, hi, lo in (("bold", 0.5, 0.3), ("italic", 0.85, 0.15)):
+            flags = smooth([getattr(w.style, attr) for w in ordered], lens, hi, lo)
+            for w, f in zip(ordered, flags):
+                setattr(w.style, attr, f)
+    for ln, cap in zip(lines, group_caps):
+        ln.size_pt = font_size_pt(cap or page_cap, RENDER_DPI)
+
+
+def _mark_underlines(rules, words: list[_Word]) -> list:
+    """Подчертава думите над линията. Връща линиите, които не са подчертаване."""
+    separators = []
+    for (x0, x1, y) in rules:
+        hit = False
+        for w in words:
+            if w.style is None:
+                continue
+            overlap = min(x1, w.right) - max(x0, w.left)
+            if overlap >= 0.5 * w.width and -0.35 * w.height <= y - w.bottom <= 0.6 * w.height:
+                w.style.underline = True
+                hit = True
+        if not hit:
+            separators.append((x0, x1, y))
+    return separators
+
+
+def _text_box(lines: list[_Line], page_width: int) -> tuple[float, float]:
+    long_lines = [ln for ln in lines if len(ln.words) >= 3]
+    if not long_lines:
+        long_lines = lines
+    if not long_lines:
+        return 0.1 * page_width, 0.9 * page_width
+    lefts = [ln.left for ln in long_lines]
+    # дясното поле: най-десният ред с поне две думи (колонтитул, подравнен вдясно
+    # ред), но не в самия край на листа (там са само бележки на ръка)
+    limit = page_width - 0.3 * RENDER_DPI
+    wordy = [ln.right for ln in lines
+             if sum(1 for w in ln.words if sum(c.isalnum() for c in w.text) >= 2) >= 2 and ln.right <= limit]
+    right = max(wordy) if wordy else 0
+    return float(np.percentile(lefts, 5)), float(max(right, np.percentile([ln.right for ln in long_lines], 95)))
+
+
 def ocr_page(page: Page, langs: str, img: Image.Image | None = None,
              clean_forms: bool = True, detect_tables: bool = True) -> None:
     """Едно минаване на Tesseract дава и текстовия слой (PDF), и позициите (TSV)."""
     img = img or page.image()
     cleaned = clean_for_ocr(img, RENDER_DPI, forms=clean_forms, tables=detect_tables)
     ocr_img, extras, grids = cleaned.image, cleaned.extras, cleaned.tables or []
+    table_grids = [g for g in grids if len(g.cells) > 1]
+    frames = [g for g in grids if len(g.cells) == 1]   # рамка около текст
     data, page.text_layer_pdf = _run_tesseract(ocr_img, langs, psm=3, want_pdf=True)
-    cell_words = _ocr_table_cells(ocr_img, grids, langs) if grids else []
+    cell_words = _ocr_table_cells(ocr_img, table_grids, langs) if table_grids else []
 
     lines = _drop_noise(_lines_from_tsv(data))
     confs = [w.conf for ln in lines for w in ln.words]
     page_text = " ".join(w.text for ln in lines for w in ln.words)
-    tables, lines, extras = _build_tables(grids, lines, extras, page_text, RENDER_DPI, cell_words)
+
+    gray = np.asarray(ocr_img.convert("L"))
+    thr = min(float(_otsu(gray)), 200.0)
+    _measure_styles(lines, cell_words, gray, thr)
+    separators = _mark_underlines(cleaned.rules or [], [w for ln in lines for w in ln.words])
+
+    tables, lines, extras = _build_tables(table_grids, lines, extras, page_text, RENDER_DPI, cell_words)
+    for ln in lines:
+        cx, cy = (ln.left + ln.right) / 2, (ln.top + ln.bottom) / 2
+        for k, f in enumerate(frames):
+            if f.contains(cx, cy):
+                ln.frame = k
+                break
     lines = _merge_rows(lines)
     _insert_extras(lines, extras)
-    paragraphs = _build_paragraphs(lines, [t.order for t in tables], page_text)
-    page.paragraphs = sorted(paragraphs + tables, key=lambda b: b.order)
+    box = _text_box(lines, img.width)
+    paragraphs = _build_paragraphs(lines, [t.order for t in tables], page_text, box)
+    blocks = sorted(paragraphs + tables, key=lambda b: b.order)
+
+    # разстояние преди абзаца и разделителни линии
+    body = [p.size_pt for p in paragraphs if p.size_pt for _ in range(len(p.text) // 20 + 1)]
+    body_pt = snap_size(statistics.median(body)) if body else 11.0
+    # Размер на ±1 pt от основния — това е грешка на мерането, а не друг шрифт
+    for p in paragraphs:
+        words = [w for w in p.text.split() if sum(c.isalpha() for c in w) >= 2 and w not in _MARKS]
+        if p.size_pt is None or abs(p.size_pt - body_pt) <= 1.0:
+            p.size_pt = body_pt
+        elif p.size_pt < body_pt and len(words) < 3:
+            p.size_pt = body_pt      # твърде малко думи за надеждно мерене
+    for t in tables:
+        for c in t.cells:
+            if c.size_pt and abs(c.size_pt - body_pt) <= 1.0:
+                c.size_pt = body_pt
+    prev_bottom = None
+    for b in blocks:
+        if prev_bottom is not None:
+            gap = b.top - prev_bottom
+            normal = 0.45 * body_pt / 72 * RENDER_DPI
+            b.space_before_pt = round(max(0.0, min(30.0, (gap - normal) / RENDER_DPI * 72)) * 2) / 2
+        prev_bottom = max(prev_bottom or 0, b.bottom)
+    width = box[1] - box[0]
+    for (x0, x1, y) in separators:
+        if x1 - x0 < 0.5 * width:
+            continue
+        below = [b for b in blocks if isinstance(b, Paragraph) and 0 <= b.top - y < 0.4 * RENDER_DPI]
+        if below:
+            min(below, key=lambda b: b.top).border_top = True
+
+    serif_boxes = [(w.left, w.top, w.width, w.height) for ln in lines for w in ln.words
+                   if w.style is not None and not w.style.bold and len(w.text) >= 4]
+    page.geom = {"width": img.width, "height": img.height, "left": box[0], "right": box[1],
+                 "top": min((b.top for b in blocks), default=int(0.08 * img.height)),
+                 "serif": is_serif(gray, serif_boxes, thr), "body_pt": snap_size(body_pt)}
+    page.paragraphs = blocks
     page.text = "\n\n".join(b.text for b in page.paragraphs)
     page.confidence = round(sum(confs) / len(confs), 1) if confs else None
     page.text_edited = False
@@ -943,7 +1293,75 @@ def _page_paragraphs(page: Page) -> list:
     return page.paragraphs
 
 
-def _docx_table(doc, block: TableBlock, avail_width) -> None:
+def _px(px: float):
+    from docx.shared import Emu
+    return Emu(int(px / RENDER_DPI * 914400))
+
+
+_ALIGN = {"left": 0, "center": 1, "right": 2, "justify": 3}
+
+
+def _set_borders(pf_element, sides: dict) -> None:
+    """Рамка на абзац: sides = {"top": размер в 1/8 pt, ...}."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    pPr = pf_element.get_or_add_pPr()
+    bdr = OxmlElement("w:pBdr")
+    for side in ("top", "left", "bottom", "right"):
+        if side in sides:
+            el = OxmlElement(f"w:{side}")
+            el.set(qn("w:val"), "single")
+            el.set(qn("w:sz"), str(sides[side]))
+            el.set(qn("w:space"), "4")
+            el.set(qn("w:color"), "000000")
+            bdr.append(el)
+    pPr.append(bdr)
+
+
+def _outline_level(paragraph, level: int) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    el = OxmlElement("w:outlineLvl")
+    el.set(qn("w:val"), str(level))
+    paragraph._p.get_or_add_pPr().append(el)
+
+
+def _docx_paragraph(doc, b: Paragraph, body_pt: float):
+    from docx.enum.text import WD_TAB_ALIGNMENT
+    from docx.shared import Pt
+
+    p = doc.add_paragraph()
+    pf = p.paragraph_format
+    pf.alignment = _ALIGN.get(b.align, 0)
+    if b.indent_px > 0.01 * RENDER_DPI:
+        pf.left_indent = _px(b.indent_px)
+    if abs(b.first_px) > 0.03 * RENDER_DPI:
+        pf.first_line_indent = _px(b.first_px)
+    if b.space_before_pt:
+        pf.space_before = Pt(b.space_before_pt)
+    kinds = {"left": WD_TAB_ALIGNMENT.LEFT, "center": WD_TAB_ALIGNMENT.CENTER, "right": WD_TAB_ALIGNMENT.RIGHT}
+    for pos, kind in b.tabs:
+        pf.tab_stops.add_tab_stop(_px(pos - b.indent_px if kind == "left" else pos - b.indent_px), kinds[kind])
+    if b.frame >= 0:
+        _set_borders(p._p, {"top": 6, "left": 6, "bottom": 6, "right": 6})
+    elif b.border_top:
+        _set_borders(p._p, {"top": 12})
+    if b.heading:
+        _outline_level(p, 0)
+        pf.keep_with_next = True
+    size = Pt(b.size_pt) if b.size_pt and b.size_pt != body_pt else None
+    for r in (b.runs or [Run(b.text)]):
+        run = p.add_run(r.text)
+        run.bold = r.bold or None
+        run.italic = r.italic or None
+        run.underline = r.underline or None
+        if size:
+            run.font.size = size
+    return p
+
+
+def _docx_table(doc, block: TableBlock, avail_width, left_margin_px: float | None = None,
+                body_pt: float = 11.0, spacer: bool = True) -> None:
     from docx.enum.table import WD_TABLE_ALIGNMENT
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
@@ -951,9 +1369,18 @@ def _docx_table(doc, block: TableBlock, avail_width) -> None:
 
     t = doc.add_table(rows=block.n_rows, cols=block.n_cols)
     t.style = "Table Grid"
-    t.alignment = WD_TABLE_ALIGNMENT.CENTER
     t.autofit = False
-    widths = [int(avail_width * w) for w in block.col_widths]
+    total = int(avail_width)
+    if block.width_px and left_margin_px is not None:
+        total = min(int(avail_width * 1.08), int(_px(block.width_px)))
+        # отстъп на таблицата спрямо полето
+        ind = OxmlElement("w:tblInd")
+        ind.set(qn("w:w"), str(int((block.left_px - left_margin_px) / RENDER_DPI * 1440)))
+        ind.set(qn("w:type"), "dxa")
+        t._tbl.tblPr.append(ind)
+    else:
+        t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    widths = [int(total * w) for w in block.col_widths]
     # ширините на колоните (tblGrid), за да ги спазват Word и LibreOffice
     grid = t._tbl.tblGrid
     for gc, w in zip(grid.findall(qn("w:gridCol")), widths):
@@ -969,41 +1396,76 @@ def _docx_table(doc, block: TableBlock, avail_width) -> None:
         cell.text = c.text
         for par in cell.paragraphs:
             par.paragraph_format.space_after = Pt(0)
+            par.paragraph_format.alignment = _ALIGN.get(c.align, 0)
             for run in par.runs:
-                run.font.size = Pt(10)
-    # Таблицата да не се „залепва“ за следващия абзац
-    doc.add_paragraph().paragraph_format.space_after = Pt(0)
+                run.font.size = Pt(c.size_pt or min(body_pt, 10))
+                run.bold = c.bold or None
+                run.italic = c.italic or None
+    # Таблицата да не се „залепва“ за следващата таблица
+    if spacer:
+        sp = doc.add_paragraph()
+        sp.paragraph_format.space_after = Pt(0)
+        sp.paragraph_format.line_spacing = Pt(4)
 
 
-def export_docx(pages: Iterable[Page], out_path: str | Path) -> None:
+def export_docx(pages: Iterable[Page], out_path: str | Path, keep_format: bool = True) -> None:
     from docx import Document
-    from docx.enum.text import WD_BREAK
+    from docx.oxml.ns import qn
     from docx.shared import Cm, Pt
 
+    pages = list(pages)
+    geom = next((p.geom for p in pages if p.geom), {}) if keep_format else {}
     doc = Document()
     sec = doc.sections[0]
-    sec.page_width, sec.page_height = Cm(21), Cm(29.7)      # A4
-    sec.left_margin = sec.right_margin = Cm(2)
-    sec.top_margin = sec.bottom_margin = Cm(2)
+    if geom:
+        # размер на страницата и полета като в оригинала
+        sec.page_width, sec.page_height = _px(geom["width"]), _px(geom["height"])
+        sec.left_margin = _px(max(0.3 * RENDER_DPI, geom["left"]))
+        sec.right_margin = _px(max(0.3 * RENDER_DPI, geom["width"] - geom["right"]))
+        top = min(max(geom.get("top", 0.6 * RENDER_DPI) - 0.1 * RENDER_DPI, 0.4 * RENDER_DPI), 1.2 * RENDER_DPI)
+        sec.top_margin = _px(top)
+        sec.bottom_margin = Cm(1.5)
+    else:
+        sec.page_width, sec.page_height = Cm(21), Cm(29.7)      # A4
+        sec.left_margin = sec.right_margin = Cm(2)
+        sec.top_margin = sec.bottom_margin = Cm(2)
     avail = sec.page_width - sec.left_margin - sec.right_margin
+    font = "Times New Roman" if geom.get("serif", False) else "Calibri" if not geom else "Arial"
+    body_pt = float(geom.get("body_pt", 11))
     normal = doc.styles["Normal"]
-    normal.font.name = "Calibri"
-    normal.font.size = Pt(11)
-    normal.paragraph_format.space_after = Pt(3)
+    normal.font.name = font
+    normal.element.rPr.rFonts.set(qn("w:eastAsia"), font)
+    normal.font.size = Pt(body_pt)
+    normal.paragraph_format.space_after = Pt(0 if geom else 3)
     normal.paragraph_format.space_before = Pt(0)
     normal.paragraph_format.line_spacing = 1.0
-    pages = list(pages)
     for n, page in enumerate(pages):
-        for b in _page_paragraphs(page):
+        left_px = page.geom.get("left") if page.geom else None
+        formatted = keep_format and bool(page.geom) and not page.text_edited
+        blocks = _page_paragraphs(page)
+        for k, b in enumerate(blocks):
+            new_page = n > 0 and k == 0
             if isinstance(b, TableBlock):
-                _docx_table(doc, b, avail)
+                if new_page:
+                    # Таблица в началото на страницата: малък абзац с „нова страница преди“
+                    br = doc.add_paragraph()
+                    br.paragraph_format.page_break_before = True
+                    br.paragraph_format.line_spacing = Pt(1)
+                nxt = blocks[k + 1] if k + 1 < len(blocks) else None
+                _docx_table(doc, b, avail, left_px if formatted else None, body_pt,
+                            spacer=isinstance(nxt, TableBlock))
+                continue
+            if formatted:
+                para = _docx_paragraph(doc, b, body_pt)
             elif b.heading:
-                h = doc.add_paragraph(style="Heading 2")
-                h.add_run(b.text)
+                para = doc.add_paragraph(style="Heading 2")
+                para.add_run(b.text)
             else:
-                doc.add_paragraph(b.text)
-        if n < len(pages) - 1:
-            doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+                para = doc.add_paragraph(b.text)
+            if new_page:
+                # „Нова страница преди абзаца“ вместо отделен разделител: ако
+                # предишната страница е пълна, разделителят би останал сам на празна страница.
+                para.paragraph_format.page_break_before = True
     doc.core_properties.author = ""
     doc.save(str(out_path))
 
@@ -1075,8 +1537,11 @@ def export_txt(pages: Iterable[Page], out_path: str | Path) -> None:
 EXPORTERS = {".pdf": export_pdf, ".docx": export_docx, ".xlsx": export_xlsx, ".txt": export_txt}
 
 
-def export(pages: Iterable[Page], out_path: str | Path) -> None:
+def export(pages: Iterable[Page], out_path: str | Path, keep_format: bool = True) -> None:
     ext = Path(out_path).suffix.lower()
     if ext not in EXPORTERS:
         raise ValueError(f"Неподдържан изходен формат: {ext}")
-    EXPORTERS[ext](pages, out_path)
+    if ext == ".docx":
+        export_docx(pages, out_path, keep_format)
+    else:
+        EXPORTERS[ext](pages, out_path)

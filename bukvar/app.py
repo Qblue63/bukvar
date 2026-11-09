@@ -265,7 +265,14 @@ class MainWindow(QMainWindow):
         self.act_tables.setChecked(self.settings.value("tables", True, type=bool))
         self.act_tables.setToolTip("Открива таблиците с линии и ги записва като истински "
                                    "таблици в Word и Excel.")
+        self.act_format = QAction("Запази форматирането в Word", self, checkable=True)
+        self.act_format.setChecked(self.settings.value("keep_format", True, type=bool))
+        self.act_format.setToolTip("Шрифт, размер, удебелен/курсив/подчертан текст, подравняване, "
+                                   "отстъпи, рамки и полета като в оригинала. Изключено — чист текст.")
+        self.act_format.toggled.connect(lambda v: self.settings.setValue("keep_format", v))
         self.opt_menu.addActions([self.act_rotate, self.act_deskew, self.act_forms, self.act_tables])
+        self.opt_menu.addSeparator()
+        self.opt_menu.addAction(self.act_format)
         self.opt_menu.setToolTipsVisible(True)
         opt_btn = QToolButton()
         opt_btn.setText("Настройки")
@@ -523,7 +530,7 @@ class MainWindow(QMainWindow):
             path += ext
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
-            engine.export(done, path)
+            engine.export(done, path, keep_format=self.act_format.isChecked())
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, APP_NAME, f"Записът не успя:\n{exc}")

@@ -43,6 +43,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-rotate", action="store_true", help="без автоматично завъртане")
     ap.add_argument("--no-deskew", action="store_true", help="без изправяне на наклона")
     ap.add_argument("--no-tables", action="store_true", help="без разпознаване на таблици")
+    ap.add_argument("--plain", action="store_true",
+                    help="Word без форматиране (само текст, абзаци и таблици)")
     ap.add_argument("--no-forms", action="store_true",
                     help="без обработка на формуляри (квадратчета ☐/☒, ръкопис, редове от точки)")
     ap.add_argument("-j", "--jobs", type=int, default=None, help="брой паралелни страници")
@@ -92,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
                                  on_page_done=tick)
             target_dir = out_dir or f.parent
             for fmt in formats:
-                engine.export(pages, target_dir / f"{f.stem}.ocr.{fmt}")
+                engine.export(pages, target_dir / f"{f.stem}.ocr.{fmt}", keep_format=not args.plain)
             errs = [p for p in pages if p.error]
             note = f", {len(errs)} страници с грешка" if errs else ""
             print(f"\r[{n}/{len(files)}] {f.name}: {len(pages)} стр. за {time.time() - t:.1f} с{note}        ")

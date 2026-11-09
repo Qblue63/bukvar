@@ -46,7 +46,8 @@ class CleanResult:
     image: Image.Image
     extras: list[Extra]
     stats: dict
-    tables: list = None  # list[TableGrid]
+    tables: list = None  # list[TableGrid]; таблица с една клетка = рамка
+    rules: list = None   # самостоятелни линии (x0, x1, y): подчертаване/разделител
 
 
 def _colored_mask(rgb: np.ndarray) -> np.ndarray:
@@ -236,7 +237,7 @@ def _line_masks(gray: np.ndarray, colored: np.ndarray, dpi: int) -> tuple[np.nda
     lm = ((gray < 215) & ~colored).astype(np.uint8) * 255
     max_thick = max(4.0, 0.022 * dpi)
 
-    def directional(close_k, open_k, axis):
+    def directional(close_k, open_k, axis, max_thick=max_thick):
         closed = cv2.morphologyEx(lm, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, close_k))
         opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, open_k))
         n, lab, st, _ = cv2.connectedComponentsWithStats((opened > 0).astype(np.uint8), 8)
@@ -262,6 +263,9 @@ def _line_masks(gray: np.ndarray, colored: np.ndarray, dpi: int) -> tuple[np.nda
         if not (top and bottom):
             keep[i] = False
     v = keep[lab]
+    # за самостоятелни линии (разделители) допускаме и дебели линии; те после
+    # се проверяват за непрекъснатост
+    _line_masks.thick_h = directional((7, 1), (int(0.3 * dpi), 1), 0, max(8.0, 0.045 * dpi))[0]
     return h, v
 
 
@@ -304,8 +308,10 @@ def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[
         ys = _cluster(ys, min_gap)
         xs = _cluster(xs, min_gap)
         nr, nc = len(ys) - 1, len(xs) - 1
-        if nr < 1 or nc < 1 or nr * nc < 2:
-            continue    # рамка около един абзац — не е таблица
+        if nr < 1 or nc < 1:
+            continue
+        if nr * nc == 1 and h > 0.4 * H:
+            continue    # рамка около цялата страница — не е таблица
         # Ред от таблица е по-висок от ред текст (иначе това са ръбовете на
         # удебелени букви в заглавие).
         if max(b - a for a, b in zip(ys, ys[1:])) < 0.13 * dpi:
@@ -357,8 +363,6 @@ def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[
             cs = [c for _, c in g]
             cells.append((min(rs), min(cs), max(rs), max(cs)))
         cells.sort()
-        if len(cells) < 2:
-            continue
         tables.append(TableGrid(xs, ys, cells))
         # Трием само отсечките, които лежат на границите на мрежата. Основите на
         # буквите в един ред също образуват тънка хоризонтална ивица, но тя е вътре в клетката.
@@ -372,8 +376,56 @@ def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[
                 on_v[j] = True
         used[y:y + h, x:x + w] |= on_h[hl] | on_v[vl]
 
+    # Самостоятелни хоризонтални линии: подчертаване или разделителна линия.
+    # Истинската линия е непрекъсната още в суровото изображение — така не
+    # бъркаме основите на буквите в един ред, които морфологията „слепва“.
+    raw = (gray < 215) & ~colored
+    rules = []
+    rule_px = np.zeros(gray.shape, dtype=bool)
+    rn, rl, rst, _ = cv2.connectedComponentsWithStats((_line_masks.thick_h & ~used).astype(np.uint8), 8)
+    for j in range(1, rn):
+        x, y, w, h, _ = rst[j]
+        if w < 0.3 * dpi:
+            continue
+        best = 0
+        for yy in range(y, y + h):
+            row = raw[yy, x:x + w]
+            d = np.diff(np.concatenate([[0], row.astype(np.int8), [0]]))
+            starts, ends = np.where(d == 1)[0], np.where(d == -1)[0]
+            if len(starts):
+                best = max(best, int((ends - starts).max()))
+        if best >= 0.9 * w:
+            rules.append((int(x), int(x + w), int(y + h // 2)))
+            rule_px[y:y + h, x:x + w] |= rl[y:y + h, x:x + w] == j
+
+    # Линиите на таблиците трием с малък ореол; подчертаването — само самата
+    # линия (с 1 px), за да не отрежем долните краища на буквите над нея.
     line_mask = cv2.dilate(used.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    # Трием само самата линия. Ако тя е малко под редa и я докосват само долните
+    # елементи на буквите („Д“, „р“) — под тях я оставяме, за да не ги срежем.
+    # Ако е точно под реда (докосва повечето букви) — трием я цялата, освен
+    # където буква я пресича (мастило и над, и под линията).
+    rule_grown = cv2.dilate(rule_px.astype(np.uint8), np.ones((3, 1), np.uint8)) > 0
+    if rule_px.any():
+        n_r, lab_r = cv2.connectedComponents(rule_grown.astype(np.uint8), 8)
+        for j in range(1, n_r):
+            comp = lab_r == j
+            cols = np.nonzero(comp.any(axis=0))[0]
+            tops, bottoms = {}, {}
+            for xx in cols:
+                yy = np.nonzero(comp[:, xx])[0]
+                tops[xx], bottoms[xx] = yy.min(), yy.max()
+            touched = [xx for xx in cols if tops[xx] > 0 and raw[tops[xx] - 1, xx]]
+            only_descenders = len(touched) < 0.35 * len(cols)
+            for xx in cols:
+                t, b = tops[xx], bottoms[xx]
+                above = t > 0 and raw[t - 1, xx]
+                below = b + 1 < raw.shape[0] and raw[b + 1, xx]
+                if (only_descenders and above) or (above and below):
+                    rule_grown[t:b + 1, xx] = False
+    line_mask |= rule_grown
     tables.sort(key=lambda t: (t.ys[0], t.xs[0]))
+    find_tables.last_rules = rules
     return tables, line_mask
 
 
@@ -393,14 +445,16 @@ def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = T
     extras: list[Extra] = []
 
     grids: list[TableGrid] = []
+    rules: list = []
     if tables:
         grids, line_mask = find_tables(gray, colored, dpi)
+        rules = find_tables.last_rules
         out[line_mask] = 255           # линиите пречат на Tesseract
         dark = dark & ~line_mask
         ink = ink & ~line_mask
 
     if not forms:
-        return CleanResult(Image.fromarray(out), extras, {"tables": len(grids)}, grids)
+        return CleanResult(Image.fromarray(out), extras, {"tables": len(grids)}, grids, rules)
 
     boxes = _find_checkboxes(dark, ink, dpi)
     for x, y, w, h, checked in boxes:
@@ -427,4 +481,4 @@ def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = T
 
     stats = {"checkboxes": len(boxes), "checked": sum(b[4] for b in boxes),
              "dots": int(dots.sum() > 0), "handwriting": len(hw), "tables": len(grids)}
-    return CleanResult(Image.fromarray(out), extras, stats, grids)
+    return CleanResult(Image.fromarray(out), extras, stats, grids, rules)
