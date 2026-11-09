@@ -78,6 +78,9 @@ def fix_scripts(text: str, context: str | None = None) -> str:
         return _fix_word(word, script, in_code)
 
     text = _WORD.sub(repl, text)
+    # „нП-089“, „оАБ“: малка първа буква пред главни — съкращение, изцяло с главни
+    text = re.sub(r"(?<![\w])([а-яa-z])([А-ЯA-Z]{1,5})(?![a-zа-я])",
+                  lambda m: m.group(1).upper() + m.group(2), text)
     if script == "cyr":
         # „Р-л“ (ръководител) често се чете „P-n“
         text = re.sub(r"(?<![\w])[РP]-[nл](?![\w])", "Р-л", text)

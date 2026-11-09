@@ -46,6 +46,7 @@ class CleanResult:
     image: Image.Image
     extras: list[Extra]
     stats: dict
+    tables: list = None  # list[TableGrid]
 
 
 def _colored_mask(rgb: np.ndarray) -> np.ndarray:
@@ -179,9 +180,208 @@ def _handwriting_regions(colored: np.ndarray, skip: list[tuple[int, int, int, in
     return regions
 
 
-def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = True) -> CleanResult:
+# --------------------------------------------------------------------------
+# Таблици с линии
+# --------------------------------------------------------------------------
+
+@dataclass
+class TableGrid:
+    """Таблица: граници на редовете (ys) и колоните (xs) и клетките.
+
+    Всяка клетка е (r0, c0, r1, c1) — първи/последен ред и колона включително;
+    слетите клетки обхващат повече от един ред или колона.
+    """
+    xs: list[int]
+    ys: list[int]
+    cells: list[tuple[int, int, int, int]]
+
+    @property
+    def bbox(self) -> tuple[int, int, int, int]:
+        return self.xs[0], self.ys[0], self.xs[-1], self.ys[-1]
+
+    def cell_rect(self, cell) -> tuple[int, int, int, int]:
+        r0, c0, r1, c1 = cell
+        return self.xs[c0], self.ys[r0], self.xs[c1 + 1], self.ys[r1 + 1]
+
+    def contains(self, x: float, y: float) -> bool:
+        x0, y0, x1, y1 = self.bbox
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def cell_at(self, x: float, y: float):
+        for cell in self.cells:
+            x0, y0, x1, y1 = self.cell_rect(cell)
+            if x0 <= x < x1 and y0 <= y < y1:
+                return cell
+        return None
+
+
+def _cluster(values: list[float], tol: float) -> list[int]:
+    values = sorted(values)
+    groups: list[list[float]] = []
+    for v in values:
+        if groups and v - groups[-1][-1] <= tol:
+            groups[-1].append(v)
+        else:
+            groups.append([v])
+    return [int(round(sum(g) / len(g))) for g in groups]
+
+
+def _line_masks(gray: np.ndarray, colored: np.ndarray, dpi: int) -> tuple[np.ndarray, np.ndarray]:
+    """Хоризонтални и вертикални линии на таблици.
+
+    Линиите често са тънки (1 px) и сиви, затова прагът е по-светъл от този
+    за текста. Текстът се отсява по дебелина: линията е тънка, а ред
+    удебелен текст, „слепен“ от морфологията, е дебела ивица.
+    """
+    lm = ((gray < 215) & ~colored).astype(np.uint8) * 255
+    max_thick = max(4.0, 0.022 * dpi)
+
+    def directional(close_k, open_k, axis):
+        closed = cv2.morphologyEx(lm, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, close_k))
+        opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, open_k))
+        n, lab, st, _ = cv2.connectedComponentsWithStats((opened > 0).astype(np.uint8), 8)
+        length = st[:, 2] if axis == 0 else st[:, 3]
+        thick = st[:, 4] / np.maximum(1, length)
+        keep = thick <= max_thick
+        keep[0] = False
+        return keep[lab], lab, st, keep
+
+    # Малко „затваряне“ само за прекъсвания от скенера; по-голямо би слепило
+    # буквите в тесни клетки с линиите над и под тях.
+    h, _, _, _ = directional((7, 1), (int(0.3 * dpi), 1), 0)
+    v, lab, st, keep = directional((1, 5), (1, int(0.14 * dpi)), 1)
+
+    # Истинската вертикална линия свързва хоризонтални линии и отгоре, и отдолу.
+    # Щрихите на буквите (Т, П, И, подчертано заглавие) докосват линия най-много от едната страна.
+    reach = max(6, int(0.03 * dpi))
+    hgrow = cv2.dilate(h.astype(np.uint8), np.ones((2 * reach + 1, 2 * reach + 1), np.uint8)) > 0
+    for i in np.nonzero(keep)[0]:
+        x, y, w, hh, _ = st[i]
+        top = hgrow[y:y + 3, x:x + w].any()
+        bottom = hgrow[y + hh - 3:y + hh, x:x + w].any()
+        if not (top and bottom):
+            keep[i] = False
+    v = keep[lab]
+    return h, v
+
+
+def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[list[TableGrid], np.ndarray]:
+    """Намира таблици с линии. Връща таблиците и маската на линиите им."""
+    H, W = gray.shape
+    hmask, vmask = _line_masks(gray, colored, dpi)
+    lines = (hmask | vmask).astype(np.uint8)
+    region = cv2.dilate(lines, np.ones((9, 9), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(region, 8)
+    tol = max(4, int(0.03 * dpi))
+    tables: list[TableGrid] = []
+    used = np.zeros(gray.shape, dtype=bool)
+
+    for i in range(1, n):
+        x, y, w, h, _ = st[i]
+        if w < 0.1 * W or h < 0.08 * dpi:
+            continue
+        sub = lab[y:y + h, x:x + w] == i
+        hs = hmask[y:y + h, x:x + w] & sub
+        vs = vmask[y:y + h, x:x + w] & sub
+
+        # Позиции на линиите
+        hn, hl, hst, hcen = cv2.connectedComponentsWithStats(hs.astype(np.uint8), 8)
+        vn, vl, vst, vcen = cv2.connectedComponentsWithStats(vs.astype(np.uint8), 8)
+        min_gap = int(0.06 * dpi)    # по-близки линии са една (двойна/дебела) линия
+        ys = _cluster([y + hcen[j, 1] for j in range(1, hn) if hst[j, 2] >= 0.2 * w or hst[j, 2] >= dpi], min_gap)
+        xs = _cluster([x + vcen[j, 0] for j in range(1, vn)], min_gap)
+        if len(ys) < 2 or len(xs) < 2:
+            continue      # таблица = поне две хоризонтални и две вертикални линии
+        # Външните граници: ако няма вертикална линия в края, ползваме края на хоризонталните
+        if xs[0] - x > min_gap:
+            xs.insert(0, int(x))
+        if x + w - xs[-1] > min_gap:
+            xs.append(int(x + w))
+        if ys[0] - y > min_gap:
+            ys.insert(0, int(y))
+        if y + h - ys[-1] > min_gap:
+            ys.append(int(y + h))
+        ys = _cluster(ys, min_gap)
+        xs = _cluster(xs, min_gap)
+        nr, nc = len(ys) - 1, len(xs) - 1
+        if nr < 1 or nc < 1 or nr * nc < 2:
+            continue    # рамка около един абзац — не е таблица
+        # Ред от таблица е по-висок от ред текст (иначе това са ръбовете на
+        # удебелени букви в заглавие).
+        if max(b - a for a, b in zip(ys, ys[1:])) < 0.13 * dpi:
+            continue
+        # Горната и долната граница са непрекъснати линии по цялата ширина.
+        def coverage(yc):
+            band = hmask[max(0, yc - tol):yc + tol + 1, xs[0]:xs[-1]]
+            return band.any(axis=0).mean() if band.size else 0.0
+        if coverage(ys[0]) < 0.7 or coverage(ys[-1]) < 0.7:
+            continue
+
+        def vcover(xc, y0, y1):
+            pad = max(2, (y1 - y0) // 6)
+            seg = vmask[y0 + pad:y1 - pad, max(0, xc - tol):xc + tol + 1]
+            return seg.any(axis=1).mean() if seg.size else 0.0
+
+        def hcover(yc, x0, x1):
+            pad = max(2, (x1 - x0) // 8)
+            seg = hmask[max(0, yc - tol):yc + tol + 1, x0 + pad:x1 - pad]
+            return seg.any(axis=0).mean() if seg.size else 0.0
+
+        # Слети клетки: липсва линия между съседни клетки
+        parent = list(range(nr * nc))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a, b):
+            parent[find(a)] = find(b)
+
+        for r in range(nr):
+            for c in range(nc - 1):
+                if vcover(xs[c + 1], ys[r], ys[r + 1]) < 0.5:
+                    union(r * nc + c, r * nc + c + 1)
+        for r in range(nr - 1):
+            for c in range(nc):
+                if hcover(ys[r + 1], xs[c], xs[c + 1]) < 0.5:
+                    union(r * nc + c, (r + 1) * nc + c)
+        groups: dict[int, list[tuple[int, int]]] = {}
+        for r in range(nr):
+            for c in range(nc):
+                groups.setdefault(find(r * nc + c), []).append((r, c))
+        cells = []
+        for g in groups.values():
+            rs = [r for r, _ in g]
+            cs = [c for _, c in g]
+            cells.append((min(rs), min(cs), max(rs), max(cs)))
+        cells.sort()
+        if len(cells) < 2:
+            continue
+        tables.append(TableGrid(xs, ys, cells))
+        # Трием само отсечките, които лежат на границите на мрежата. Основите на
+        # буквите в един ред също образуват тънка хоризонтална ивица, но тя е вътре в клетката.
+        on_h = np.zeros(hn, bool)
+        for j in range(1, hn):
+            if min(abs(y + hcen[j, 1] - yy) for yy in ys) <= tol:
+                on_h[j] = True
+        on_v = np.zeros(vn, bool)
+        for j in range(1, vn):
+            if min(abs(x + vcen[j, 0] - xx) for xx in xs) <= tol:
+                on_v[j] = True
+        used[y:y + h, x:x + w] |= on_h[hl] | on_v[vl]
+
+    line_mask = cv2.dilate(used.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    tables.sort(key=lambda t: (t.ys[0], t.xs[0]))
+    return tables, line_mask
+
+
+def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = True,
+                  forms: bool = True, tables: bool = True) -> CleanResult:
     rgb = np.asarray(img.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    remove_handwriting = remove_handwriting and forms
     colored = _colored_mask(rgb) if remove_handwriting else np.zeros(gray.shape, bool)
     # праг за „мастило“: Otsu, но не по-светъл от 200
     thr, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
@@ -191,6 +391,16 @@ def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = T
 
     out = gray.copy()
     extras: list[Extra] = []
+
+    grids: list[TableGrid] = []
+    if tables:
+        grids, line_mask = find_tables(gray, colored, dpi)
+        out[line_mask] = 255           # линиите пречат на Tesseract
+        dark = dark & ~line_mask
+        ink = ink & ~line_mask
+
+    if not forms:
+        return CleanResult(Image.fromarray(out), extras, {"tables": len(grids)}, grids)
 
     boxes = _find_checkboxes(dark, ink, dpi)
     for x, y, w, h, checked in boxes:
@@ -216,5 +426,5 @@ def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = T
     out[dots] = 255
 
     stats = {"checkboxes": len(boxes), "checked": sum(b[4] for b in boxes),
-             "dots": int(dots.sum() > 0), "handwriting": len(hw)}
-    return CleanResult(Image.fromarray(out), extras, stats)
+             "dots": int(dots.sum() > 0), "handwriting": len(hw), "tables": len(grids)}
+    return CleanResult(Image.fromarray(out), extras, stats, grids)

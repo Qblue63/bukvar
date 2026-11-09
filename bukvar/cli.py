@@ -37,11 +37,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="bukvar-cli", description="Буквар OCR — разпознаване на текст от PDF и изображения.")
     ap.add_argument("inputs", nargs="*", help="файлове или папки")
     ap.add_argument("-o", "--out", help="папка за резултатите (по подразбиране: до оригинала)")
-    ap.add_argument("-f", "--formats", default="pdf", help="pdf,docx,txt (по подразбиране: pdf)")
+    ap.add_argument("-f", "--formats", default="pdf", help="pdf,docx,xlsx,txt (по подразбиране: pdf)")
     ap.add_argument("-l", "--lang", default="bul+eng", help="езици, напр. bul+eng (по подразбиране)")
     ap.add_argument("-r", "--recursive", action="store_true", help="обхожда и подпапките")
     ap.add_argument("--no-rotate", action="store_true", help="без автоматично завъртане")
     ap.add_argument("--no-deskew", action="store_true", help="без изправяне на наклона")
+    ap.add_argument("--no-tables", action="store_true", help="без разпознаване на таблици")
     ap.add_argument("--no-forms", action="store_true",
                     help="без обработка на формуляри (квадратчета ☐/☒, ръкопис, редове от точки)")
     ap.add_argument("-j", "--jobs", type=int, default=None, help="брой паралелни страници")
@@ -87,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
 
             engine.process_pages(pages, args.lang, not args.no_rotate, not args.no_deskew,
                                  workers=args.jobs, clean_forms=not args.no_forms,
+                                 detect_tables=not args.no_tables,
                                  on_page_done=tick)
             target_dir = out_dir or f.parent
             for fmt in formats:

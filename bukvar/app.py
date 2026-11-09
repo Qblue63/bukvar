@@ -42,10 +42,11 @@ class OcrWorker(QObject):
     finished = Signal()
     failed = Signal(str)
 
-    def __init__(self, pages, indexes, langs, auto_rotate, deskew, forms=True):
+    def __init__(self, pages, indexes, langs, auto_rotate, deskew, forms=True, tables=True):
         super().__init__()
         self.pages, self.indexes = pages, indexes
         self.langs, self.auto_rotate, self.deskew, self.forms = langs, auto_rotate, deskew, forms
+        self.tables = tables
         self._stop = threading.Event()
 
     def stop(self) -> None:
@@ -57,7 +58,7 @@ class OcrWorker(QObject):
             for p in subset:
                 p.reset()
             engine.process_pages(subset, self.langs, self.auto_rotate, self.deskew,
-                                 clean_forms=self.forms,
+                                 clean_forms=self.forms, detect_tables=self.tables,
                                  on_page_done=lambda k: self.page_done.emit(self.indexes[k]),
                                  should_stop=self._stop.is_set)
         except Exception as exc:  # pragma: no cover - показва се на потребителя
@@ -260,7 +261,11 @@ class MainWindow(QMainWindow):
         self.act_forms.setChecked(self.settings.value("forms", True, type=bool))
         self.act_forms.setToolTip("Разпознава квадратчетата за отметка, маха подписите и "
                                   "ръкописа (синьо мастило) и редовете от точки.")
-        self.opt_menu.addActions([self.act_rotate, self.act_deskew, self.act_forms])
+        self.act_tables = QAction("Таблици", self, checkable=True)
+        self.act_tables.setChecked(self.settings.value("tables", True, type=bool))
+        self.act_tables.setToolTip("Открива таблиците с линии и ги записва като истински "
+                                   "таблици в Word и Excel.")
+        self.opt_menu.addActions([self.act_rotate, self.act_deskew, self.act_forms, self.act_tables])
         self.opt_menu.setToolTipsVisible(True)
         opt_btn = QToolButton()
         opt_btn.setText("Настройки")
@@ -273,6 +278,7 @@ class MainWindow(QMainWindow):
         save_menu = QMenu(self)
         self.act_save_pdf = save_menu.addAction("Търсим PDF…", lambda: self.save(".pdf"))
         self.act_save_docx = save_menu.addAction("Word документ (DOCX)…", lambda: self.save(".docx"))
+        self.act_save_xlsx = save_menu.addAction("Таблиците в Excel (XLSX)…", lambda: self.save(".xlsx"))
         self.act_save_txt = save_menu.addAction("Текстов файл (TXT)…", lambda: self.save(".txt"))
         self.save_button = QToolButton()
         self.save_button.setText("Запиши като")
@@ -446,6 +452,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("auto_rotate", self.act_rotate.isChecked())
         self.settings.setValue("deskew", self.act_deskew.isChecked())
         self.settings.setValue("forms", self.act_forms.isChecked())
+        self.settings.setValue("tables", self.act_tables.isChecked())
         self._done_count, self._total = 0, len(indexes)
         self.progress.setRange(0, len(indexes))
         self.progress.setValue(0)
@@ -455,7 +462,7 @@ class MainWindow(QMainWindow):
         self._ocr_thread = QThread(self)
         self._ocr_worker = OcrWorker(self.pages, indexes, langs,
                                      self.act_rotate.isChecked(), self.act_deskew.isChecked(),
-                                     self.act_forms.isChecked())
+                                     self.act_forms.isChecked(), self.act_tables.isChecked())
         self._ocr_worker.moveToThread(self._ocr_thread)
         self._ocr_thread.started.connect(self._ocr_worker.run)
         self._ocr_worker.page_done.connect(self._page_done)
@@ -507,7 +514,8 @@ class MainWindow(QMainWindow):
                                     "В PDF невидимият текстов слой остава от разпознаването.")
         default_dir = Path(self.settings.value("save_dir", str(done[0].source.parent)))
         default = default_dir / f"{done[0].source.stem}.ocr{ext}"
-        names = {".pdf": "PDF (*.pdf)", ".docx": "Word (*.docx)", ".txt": "Текст (*.txt)"}
+        names = {".pdf": "PDF (*.pdf)", ".docx": "Word (*.docx)", ".xlsx": "Excel (*.xlsx)",
+                 ".txt": "Текст (*.txt)"}
         path, _ = QFileDialog.getSaveFileName(self, "Запис", str(default), names[ext])
         if not path:
             return

@@ -104,6 +104,35 @@ class Paragraph:
     text: str
     size: float          # средна височина на реда в пиксели
     heading: bool = False
+    order: float = 0.0   # място в страницата (за подреждане спрямо таблиците)
+
+
+@dataclass
+class TableCell:
+    row: int
+    col: int
+    rowspan: int
+    colspan: int
+    text: str = ""
+
+
+@dataclass
+class TableBlock:
+    n_rows: int
+    n_cols: int
+    cells: list[TableCell]
+    col_widths: list[float]   # относителни ширини на колоните
+    order: float = 0.0
+
+    def rows_text(self) -> list[list[str]]:
+        grid = [["" for _ in range(self.n_cols)] for _ in range(self.n_rows)]
+        for c in self.cells:
+            grid[c.row][c.col] = c.text
+        return grid
+
+    @property
+    def text(self) -> str:
+        return "\n".join("\t".join(r) for r in self.rows_text())
 
 
 _TMP_DIR: Path | None = None
@@ -142,7 +171,7 @@ class Page:
     processed_path: Path | None = None  # подготвено (завъртяно/изправено) изображение
     geometry_changed: bool = False
     text: str = ""
-    paragraphs: list[Paragraph] = field(default_factory=list)
+    paragraphs: list = field(default_factory=list)   # Paragraph | TableBlock
     text_layer_pdf: bytes | None = None   # невидим текстов слой
     confidence: float | None = None
     text_edited: bool = False
@@ -373,6 +402,12 @@ def _lines_from_tsv(data: dict) -> list[_Line]:
     return list(lines.values())
 
 
+def _drop_noise_words(words: list[_Word]) -> list[_Word]:
+    line = _Line(0, 0, 0.0, list(words))
+    kept = _drop_noise([line]) if words else []
+    return kept[0].words if kept else []
+
+
 def _drop_noise(lines: list[_Line]) -> list[_Line]:
     """Маха остатъци от ръкопис/печати: думи с много ниска увереност."""
     kept = []
@@ -443,11 +478,14 @@ def _insert_extras(lines: list[_Line], extras) -> None:
             lines.append(_Line(-1, -1, -1 + 0.001 * len(lines), [word]))
 
 
-def _build_paragraphs(lines: list[_Line]) -> list[Paragraph]:
+def _build_paragraphs(lines: list[_Line], breaks: list[float] = (),
+                      page_text: str | None = None) -> list[Paragraph]:
+    """breaks: места (order) на таблиците — абзац не може да ги прескача."""
     lines = sorted(lines, key=lambda ln: ln.order)
     if not lines:
         return []
-    page_text = " ".join(w.text for ln in lines for w in ln.words)
+    if page_text is None:
+        page_text = " ".join(w.text for ln in lines for w in ln.words)
     # Дясната граница на текста в блока — за да познаем кратките (последни) редове
     block_right: dict[int, int] = {}
     for ln in lines:
@@ -455,13 +493,15 @@ def _build_paragraphs(lines: list[_Line]) -> list[Paragraph]:
 
     paragraphs: list[Paragraph] = []
     cur_text, cur_heights, prev = "", [], None
+    cur_order = 0.0
     prev_tabbed = False
     paragraphs_text_tail = ""
 
     def flush():
         nonlocal cur_text, cur_heights
         if cur_text.strip():
-            paragraphs.append(Paragraph(text=cur_text.strip(), size=statistics.median(cur_heights)))
+            paragraphs.append(Paragraph(text=cur_text.strip(), size=statistics.median(cur_heights),
+                                        order=cur_order))
         cur_text, cur_heights = "", []
 
     for ln in lines:
@@ -485,7 +525,10 @@ def _build_paragraphs(lines: list[_Line]) -> list[Paragraph]:
                           and not tabbed and not prev_tabbed
                           and not any(m in prev_text for m in _MARKS)
                           and 0 <= ln.top - prev.bottom < 1.8 * ph)
-            if lower_cont or (continues and (ln.block != prev.block or ln.par != prev.par)):
+            table_between = any(prev.order < b < ln.order for b in breaks)
+            if table_between:
+                new_par = True
+            elif lower_cont or (continues and (ln.block != prev.block or ln.par != prev.par)):
                 pass
             elif (ln.block != prev.block or ln.par != prev.par
                     or tabbed or prev_tabbed
@@ -498,6 +541,7 @@ def _build_paragraphs(lines: list[_Line]) -> list[Paragraph]:
         if new_par:
             flush()
             cur_text = text
+            cur_order = ln.order
         elif cur_text.endswith("-") and text[:1].islower() and len(cur_text) > 1 and cur_text[-2].isalpha():
             cur_text = cur_text[:-1] + text   # пренесена дума
         else:
@@ -511,6 +555,159 @@ def _build_paragraphs(lines: list[_Line]) -> list[Paragraph]:
     for p in paragraphs:
         p.heading = body > 0 and p.size >= body * 1.45 and len(p.text) < 160
     return paragraphs
+
+
+def _cell_text(words: list[_Word], page_text: str) -> str:
+    """Текст на клетка: думите по редове, редовете слети в едно изречение."""
+    if not words:
+        return ""
+    words = sorted(words, key=lambda w: (w.top + w.height / 2))
+    rows: list[list[_Word]] = []
+    for w in words:
+        cy = w.top + w.height / 2
+        for row in rows:
+            top = min(x.top for x in row)
+            bottom = max(x.bottom for x in row)
+            if top - 0.2 * w.height <= cy <= bottom + 0.2 * w.height:
+                row.append(w)
+                break
+        else:
+            rows.append([w])
+    out = ""
+    for row in rows:
+        t = " ".join(w.text for w in sorted(row, key=lambda w: w.left))
+        if out.endswith("-") and t[:1].islower() and len(out) > 1 and out[-2].isalpha():
+            out = out[:-1] + t
+        else:
+            out = f"{out} {t}" if out else t
+    letters = sum(ch.isalpha() for ch in out)
+    out = fix_scripts(out, None if letters >= 20 else page_text)
+    # заглавие на колона „№“ често се чете като „Ло“, „No“, „Хо“
+    if out in ("Ло", "No", "Ne", "Хо", "Nо", "Мо", "Nе", "N", "Ns", "Ле"):
+        out = "№"
+    return _collapse_marks(out)
+
+
+def _split_borderless_columns(grid, words: list[_Word], dpi: int) -> None:
+    """Колони без линия: празнина, която минава през всички редове на колоната
+    (напр. „Номер:      6673“). Добавя нова граница в grid.xs."""
+    min_gap = 0.09 * dpi    # ~2 интервала между думи
+    changed = True
+    while changed:
+        changed = False
+        for c in range(len(grid.xs) - 1):
+            cells = [cell for cell in grid.cells if cell[1] == c and cell[3] == c]
+            if len(cells) < 2:
+                continue
+            x0, x1 = grid.xs[c], grid.xs[c + 1]
+            occupied = np.zeros(int(x1 - x0) + 1, bool)
+            per_cell = []
+            for cell in cells:
+                cx0, cy0, cx1, cy1 = grid.cell_rect(cell)
+                ws = [w for w in words if cx0 <= w.left + w.width / 2 < cx1 and cy0 <= w.top + w.height / 2 < cy1]
+                per_cell.append(ws)
+                for w in ws:
+                    occupied[max(0, w.left - x0):max(0, w.right - x0) + 1] = True
+            # всички празни участъци вътре в колоната
+            free = ~occupied
+            best = None
+            k = 0
+            margin = int(0.05 * dpi)
+            while k < len(free):
+                if free[k]:
+                    j = k
+                    while j < len(free) and free[j]:
+                        j += 1
+                    if k > margin and j < len(free) - margin and j - k >= min_gap:
+                        mid = x0 + (k + j) // 2
+                        both = sum(1 for ws in per_cell
+                                   if any(w.right < mid for w in ws) and any(w.left > mid for w in ws))
+                        if both >= max(2, 0.6 * len(cells)) and (best is None or j - k > best[1]):
+                            best = (mid, j - k)
+                    k = j
+                else:
+                    k += 1
+            if best is None:
+                continue
+            mid = int(best[0])
+            new_cells = []
+            for (r0, c0, r1, c1) in grid.cells:
+                if c0 > c:
+                    new_cells.append((r0, c0 + 1, r1, c1 + 1))
+                elif c0 == c and c1 == c:
+                    new_cells.append((r0, c, r1, c))
+                    new_cells.append((r0, c + 1, r1, c + 1))
+                elif c0 <= c <= c1:
+                    new_cells.append((r0, c0, r1, c1 + 1))
+                else:
+                    new_cells.append((r0, c0, r1, c1))
+            grid.xs.insert(c + 1, mid)
+            grid.cells = sorted(new_cells)
+            changed = True
+            break
+
+
+def _build_tables(grids, lines: list[_Line], extras, page_text: str, dpi: int,
+                  cell_words: list[list[_Word]] | None = None):
+    """Изважда думите в таблиците от редовете и прави TableBlock-ове."""
+    if not grids:
+        return [], lines, list(extras)
+    table_words: list[list[_Word]] = [[] for _ in grids]
+
+    def which(x: float, y: float) -> int | None:
+        for k, g in enumerate(grids):
+            if g.contains(x, y):
+                return k
+        return None
+
+    rest_lines = []
+    for ln in lines:
+        keep = []
+        for w in ln.words:
+            k = which(w.left + w.width / 2, w.top + w.height / 2)
+            if k is None:
+                keep.append(w)
+            elif not cell_words:
+                table_words[k].append(w)
+            # иначе думата е разпозната по-добре клетка по клетка
+        if keep:
+            ln.words = keep
+            rest_lines.append(ln)
+    if cell_words:
+        for k, ws in enumerate(cell_words):
+            # В клетката кратките думи („1“, „№“, „ТН.“) са нормални — махаме
+            # само чисти препинателни знаци с ниска увереност.
+            table_words[k].extend(w for w in ws
+                                  if any(ch.isalnum() for ch in w.text) or w.conf >= 50)
+    rest_extras = []
+    for e in extras:
+        k = which(e.cx, e.cy)
+        if k is None:
+            rest_extras.append(e)
+        else:
+            table_words[k].append(_Word(e.text, e.left, e.top, e.width, e.height, _EXTRA_CONF))
+
+    blocks = []
+    for g, words in zip(grids, table_words):
+        _split_borderless_columns(g, words, dpi)
+        by_cell: dict[tuple, list[_Word]] = {cell: [] for cell in g.cells}
+        for w in words:
+            cell = g.cell_at(w.left + w.width / 2, w.top + w.height / 2)
+            if cell is not None:
+                by_cell[cell].append(w)
+        cells = [TableCell(r0, c0, r1 - r0 + 1, c1 - c0 + 1, _cell_text(by_cell[(r0, c0, r1, c1)], page_text))
+                 for (r0, c0, r1, c1) in g.cells]
+        total = g.xs[-1] - g.xs[0]
+        widths = [(g.xs[j + 1] - g.xs[j]) / total for j in range(len(g.xs) - 1)]
+        # място в текста: след последния ред над таблицата
+        top = g.ys[0]
+        above = [ln.order for ln in rest_lines if ln.bottom <= top + 5]
+        order = (max(above) if above else -1.0) + 0.5
+        blocks.append(TableBlock(len(g.ys) - 1, len(g.xs) - 1, cells, widths, order))
+    # две таблици на едно и също място — запазваме реда им отгоре надолу
+    for k, b in enumerate(blocks):
+        b.order += 0.001 * k
+    return blocks, rest_lines, rest_extras
 
 
 def _parse_tsv(tsv: str) -> dict:
@@ -531,36 +728,125 @@ def _parse_tsv(tsv: str) -> dict:
     return data
 
 
-def ocr_page(page: Page, langs: str, img: Image.Image | None = None,
-             clean_forms: bool = True) -> None:
-    """Едно минаване на Tesseract дава и текстовия слой (PDF), и позициите (TSV)."""
-    img = img or page.image()
-    extras = []
-    if clean_forms:
-        cleaned = clean_for_ocr(img, RENDER_DPI)
-        ocr_img, extras = cleaned.image, cleaned.extras
-    else:
-        ocr_img = img
+def _run_tesseract(img: Image.Image, langs: str, psm: int = 3,
+                   want_pdf: bool = False) -> tuple[dict, bytes | None]:
     with tempfile.TemporaryDirectory(prefix="bukvar_") as tmp:
         src = Path(tmp) / "page.png"
         base = Path(tmp) / "out"
-        ocr_img.save(src, dpi=(RENDER_DPI, RENDER_DPI))
+        img.save(src, dpi=(RENDER_DPI, RENDER_DPI))
         cmd = [pytesseract.pytesseract.tesseract_cmd, str(src), str(base),
-               "-l", langs, "--psm", "3", "--dpi", str(RENDER_DPI),
-               "-c", "textonly_pdf=1", "-c", "tessedit_create_pdf=1",
+               "-l", langs, "--psm", str(psm), "--dpi", str(RENDER_DPI),
                "-c", "tessedit_create_tsv=1", "-c", "tessedit_create_txt=0"]
+        if want_pdf:
+            cmd += ["-c", "textonly_pdf=1", "-c", "tessedit_create_pdf=1"]
         flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
         res = subprocess.run(cmd, capture_output=True, creationflags=flags)
         if res.returncode != 0:
             raise RuntimeError(res.stderr.decode("utf-8", "replace").strip() or "Tesseract грешка")
         data = _parse_tsv(base.with_suffix(".tsv").read_text(encoding="utf-8"))
-        page.text_layer_pdf = base.with_suffix(".pdf").read_bytes()
+        pdf = base.with_suffix(".pdf").read_bytes() if want_pdf else None
+    return data, pdf
 
-    lines = _merge_rows(_drop_noise(_lines_from_tsv(data)))
+
+def _ocr_table_cells(img: Image.Image, grids, langs: str) -> list[list[_Word]]:
+    """Разпознава клетките на таблиците поотделно.
+
+    Цялата страница наведнъж кара Tesseract да бърка тесните колони, а
+    отделно извикване за всяка клетка е бавно. Затова изрязваме клетките,
+    нареждаме ги една под друга с широки празни ивици и ги разпознаваме с
+    едно извикване. После връщаме думите на местата им в страницата."""
+    gray = img.convert("L")
+    arr = np.asarray(gray)
+    inset = 3
+    gap = int(0.15 * RENDER_DPI)
+    pad = int(0.1 * RENDER_DPI)
+    pieces = []   # (table index, crop x0, crop y0, y в общото изображение, височина)
+    y = pad
+    width = 0
+    for k, g in enumerate(grids):
+        for cell in g.cells:
+            x0, y0, x1, y1 = g.cell_rect(cell)
+            x0, y0, x1, y1 = x0 + inset, y0 + inset, x1 - inset, y1 - inset
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                continue
+            if (arr[y0:y1, x0:x1] < 160).sum() < 20:
+                continue   # празна клетка
+            pieces.append((k, x0, y0, x1, y1, y))
+            y += (y1 - y0) + gap
+            width = max(width, x1 - x0)
+    words: list[list[_Word]] = [[] for _ in grids]
+    if not pieces:
+        return words
+    canvas = Image.new("L", (width + 2 * pad, y + pad), 255)
+    for (_, x0, y0, x1, y1, yy) in pieces:
+        canvas.paste(gray.crop((x0, y0, x1, y1)), (pad, yy))
+    data, _ = _run_tesseract(canvas, langs, psm=4)
+    found = set()
+    for i, t in enumerate(data["text"]):
+        if not t or not t.strip() or data["conf"][i] < 0:
+            continue
+        cy = data["top"][i] + data["height"][i] / 2
+        for n, (k, x0, y0, x1, y1, yy) in enumerate(pieces):
+            if yy - gap / 2 <= cy < yy + (y1 - y0) + gap / 2:
+                words[k].append(_Word(t, data["left"][i] - pad + x0, data["top"][i] - yy + y0,
+                                      data["width"][i], data["height"][i], data["conf"][i]))
+                found.add(n)
+                break
+
+    # Втори проход за клетки с мастило, но без разпознат текст — обикновено
+    # единичен знак („1“, „№“), който Tesseract пропуска в голямо празно поле.
+    missing = []
+    for n, (k, x0, y0, x1, y1, yy) in enumerate(pieces):
+        if n in found:
+            continue
+        ink = np.argwhere(arr[y0:y1, x0:x1] < 160)
+        if len(ink) < 20:
+            continue
+        (iy0, ix0), (iy1, ix1) = ink.min(axis=0), ink.max(axis=0)
+        missing.append((k, x0 + ix0, y0 + iy0, x0 + ix1 + 1, y0 + iy1 + 1))
+    if missing:
+        line_h = max(b[4] - b[2] for b in missing) + 2 * pad
+        sep = int(0.3 * RENDER_DPI)
+        total_w = sum(b[3] - b[1] for b in missing) + sep * (len(missing) + 1)
+        strip = Image.new("L", (total_w, line_h), 255)
+        spans = []
+        x = sep
+        for (k, bx0, by0, bx1, by1) in missing:
+            yo = (line_h - (by1 - by0)) // 2
+            strip.paste(gray.crop((bx0, by0, bx1, by1)), (x, yo))
+            spans.append((k, bx0, by0, x, x + (bx1 - bx0), yo))
+            x += (bx1 - bx0) + sep
+        data, _ = _run_tesseract(strip, langs, psm=7)
+        for i, t in enumerate(data["text"]):
+            if not t or not t.strip() or data["conf"][i] < 0:
+                continue
+            cx = data["left"][i] + data["width"][i] / 2
+            for (k, bx0, by0, sx0, sx1, yo) in spans:
+                if sx0 - sep / 2 <= cx < sx1 + sep / 2:
+                    words[k].append(_Word(t, data["left"][i] - sx0 + bx0, data["top"][i] - yo + by0,
+                                          data["width"][i], data["height"][i], data["conf"][i]))
+                    break
+    return words
+
+
+def ocr_page(page: Page, langs: str, img: Image.Image | None = None,
+             clean_forms: bool = True, detect_tables: bool = True) -> None:
+    """Едно минаване на Tesseract дава и текстовия слой (PDF), и позициите (TSV)."""
+    img = img or page.image()
+    cleaned = clean_for_ocr(img, RENDER_DPI, forms=clean_forms, tables=detect_tables)
+    ocr_img, extras, grids = cleaned.image, cleaned.extras, cleaned.tables or []
+    data, page.text_layer_pdf = _run_tesseract(ocr_img, langs, psm=3, want_pdf=True)
+    cell_words = _ocr_table_cells(ocr_img, grids, langs) if grids else []
+
+    lines = _drop_noise(_lines_from_tsv(data))
     confs = [w.conf for ln in lines for w in ln.words]
+    page_text = " ".join(w.text for ln in lines for w in ln.words)
+    tables, lines, extras = _build_tables(grids, lines, extras, page_text, RENDER_DPI, cell_words)
+    lines = _merge_rows(lines)
     _insert_extras(lines, extras)
-    page.paragraphs = _build_paragraphs(lines)
-    page.text = "\n\n".join(p.text for p in page.paragraphs)
+    paragraphs = _build_paragraphs(lines, [t.order for t in tables], page_text)
+    page.paragraphs = sorted(paragraphs + tables, key=lambda b: b.order)
+    page.text = "\n\n".join(b.text for b in page.paragraphs)
     page.confidence = round(sum(confs) / len(confs), 1) if confs else None
     page.text_edited = False
     page.done = True
@@ -568,7 +854,7 @@ def ocr_page(page: Page, langs: str, img: Image.Image | None = None,
 
 def process_pages(pages: list[Page], langs: str, auto_rotate: bool = True,
                   deskew: bool = True, workers: int | None = None,
-                  clean_forms: bool = True,
+                  clean_forms: bool = True, detect_tables: bool = True,
                   on_page_done: Callable[[int], None] | None = None,
                   should_stop: Callable[[], bool] | None = None) -> None:
     """Обработва страниците паралелно. on_page_done(i) се вика за всяка готова."""
@@ -579,7 +865,7 @@ def process_pages(pages: list[Page], langs: str, auto_rotate: bool = True,
             return i
         try:
             img = preprocess(pages[i], auto_rotate, deskew)
-            ocr_page(pages[i], langs, img, clean_forms)
+            ocr_page(pages[i], langs, img, clean_forms, detect_tables)
             pages[i].error = None
         except Exception as exc:  # една лоша страница не спира останалите
             pages[i].error = str(exc)
@@ -638,19 +924,68 @@ def export_pdf(pages: Iterable[Page], out_path: str | Path) -> None:
         writer.write(fh)
 
 
-def _page_paragraphs(page: Page) -> list[Paragraph]:
+def _page_paragraphs(page: Page) -> list:
     if page.text_edited or not page.paragraphs:
         chunks = [c.strip() for c in re.split(r"\n\s*\n", page.text) if c.strip()]
-        return [Paragraph(c.replace("\n", " "), 0) for c in chunks]
+        blocks = []
+        for c in chunks:
+            rows = c.split("\n")
+            # ръчно редактирана таблица: редове с табулации
+            if len(rows) > 1 and all("\t" in r for r in rows):
+                grid = [r.split("\t") for r in rows]
+                n_cols = max(len(r) for r in grid)
+                cells = [TableCell(i, j, 1, 1, r[j] if j < len(r) else "")
+                         for i, r in enumerate(grid) for j in range(n_cols)]
+                blocks.append(TableBlock(len(grid), n_cols, cells, [1 / n_cols] * n_cols))
+            else:
+                blocks.append(Paragraph(c.replace("\n", " "), 0))
+        return blocks
     return page.paragraphs
+
+
+def _docx_table(doc, block: TableBlock, avail_width) -> None:
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+
+    t = doc.add_table(rows=block.n_rows, cols=block.n_cols)
+    t.style = "Table Grid"
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    t.autofit = False
+    widths = [int(avail_width * w) for w in block.col_widths]
+    # ширините на колоните (tblGrid), за да ги спазват Word и LibreOffice
+    grid = t._tbl.tblGrid
+    for gc, w in zip(grid.findall(qn("w:gridCol")), widths):
+        gc.set(qn("w:w"), str(int(w / 635)))   # EMU → twips
+    for row in t.rows:
+        for j, cell in enumerate(row.cells):
+            cell.width = widths[j]
+    for c in block.cells:
+        cell = t.cell(c.row, c.col)
+        if c.rowspan > 1 or c.colspan > 1:
+            cell = cell.merge(t.cell(c.row + c.rowspan - 1, c.col + c.colspan - 1))
+            cell.width = sum(widths[c.col:c.col + c.colspan])
+        cell.text = c.text
+        for par in cell.paragraphs:
+            par.paragraph_format.space_after = Pt(0)
+            for run in par.runs:
+                run.font.size = Pt(10)
+    # Таблицата да не се „залепва“ за следващия абзац
+    doc.add_paragraph().paragraph_format.space_after = Pt(0)
 
 
 def export_docx(pages: Iterable[Page], out_path: str | Path) -> None:
     from docx import Document
     from docx.enum.text import WD_BREAK
-    from docx.shared import Pt
+    from docx.shared import Cm, Pt
 
     doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21), Cm(29.7)      # A4
+    sec.left_margin = sec.right_margin = Cm(2)
+    sec.top_margin = sec.bottom_margin = Cm(2)
+    avail = sec.page_width - sec.left_margin - sec.right_margin
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
     normal.font.size = Pt(11)
@@ -659,16 +994,77 @@ def export_docx(pages: Iterable[Page], out_path: str | Path) -> None:
     normal.paragraph_format.line_spacing = 1.0
     pages = list(pages)
     for n, page in enumerate(pages):
-        for p in _page_paragraphs(page):
-            if p.heading:
+        for b in _page_paragraphs(page):
+            if isinstance(b, TableBlock):
+                _docx_table(doc, b, avail)
+            elif b.heading:
                 h = doc.add_paragraph(style="Heading 2")
-                h.add_run(p.text)
+                h.add_run(b.text)
             else:
-                doc.add_paragraph(p.text)
+                doc.add_paragraph(b.text)
         if n < len(pages) - 1:
             doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
     doc.core_properties.author = ""
     doc.save(str(out_path))
+
+
+def export_xlsx(pages: Iterable[Page], out_path: str | Path) -> None:
+    """Всички таблици в Excel: една след друга, с празен ред между тях.
+    Ако няма таблици, записва текста по абзаци."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, Side
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Таблици"
+    thin = Side(style="thin", color="808080")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    wrap = Alignment(wrap_text=True, vertical="top")
+    row0 = 1
+    max_cols = 1
+    found = False
+    for page in pages:
+        for b in _page_paragraphs(page):
+            if not isinstance(b, TableBlock):
+                continue
+            found = True
+            ws.cell(row=row0, column=1, value=f"{page.label}").font = Font(italic=True, color="808080")
+            row0 += 1
+            for c in b.cells:
+                cell = ws.cell(row=row0 + c.row, column=1 + c.col, value=_xlsx_value(c.text))
+                cell.alignment = wrap
+                if c.rowspan > 1 or c.colspan > 1:
+                    ws.merge_cells(start_row=row0 + c.row, start_column=1 + c.col,
+                                   end_row=row0 + c.row + c.rowspan - 1, end_column=c.col + c.colspan)
+            for r in range(b.n_rows):
+                for j in range(b.n_cols):
+                    ws.cell(row=row0 + r, column=1 + j).border = border
+            max_cols = max(max_cols, b.n_cols)
+            row0 += b.n_rows + 1
+    if not found:
+        ws.title = "Текст"
+        for page in pages:
+            for b in _page_paragraphs(page):
+                ws.cell(row=row0, column=1, value=b.text).alignment = wrap
+                row0 += 1
+        ws.column_dimensions["A"].width = 100
+    else:
+        from openpyxl.utils import get_column_letter
+        for j in range(1, max_cols + 1):
+            ws.column_dimensions[get_column_letter(j)].width = 28
+    wb.save(str(out_path))
+
+
+def _xlsx_value(text: str):
+    """Числата стават числа (1 234,56 → 1234.56), останалото остава текст."""
+    t = text.strip()
+    if re.fullmatch(r"-?\d{1,3}([ \u00a0]\d{3})*([.,]\d+)?|-?\d+([.,]\d+)?", t):
+        num = t.replace(" ", "").replace("\u00a0", "").replace(",", ".")
+        try:
+            return int(num) if re.fullmatch(r"-?\d+", num) and not (len(num) > 1 and num.startswith("0")) else float(num) if "." in num else num
+        except ValueError:
+            return t
+    return t
 
 
 def export_txt(pages: Iterable[Page], out_path: str | Path) -> None:
@@ -676,7 +1072,7 @@ def export_txt(pages: Iterable[Page], out_path: str | Path) -> None:
     Path(out_path).write_text(text, encoding="utf-8")
 
 
-EXPORTERS = {".pdf": export_pdf, ".docx": export_docx, ".txt": export_txt}
+EXPORTERS = {".pdf": export_pdf, ".docx": export_docx, ".xlsx": export_xlsx, ".txt": export_txt}
 
 
 def export(pages: Iterable[Page], out_path: str | Path) -> None:

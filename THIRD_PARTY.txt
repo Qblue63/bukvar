@@ -7,6 +7,7 @@ Qt for Python (PySide6) — LGPL v3 (библиотеките са отделн�
 pypdfium2 / PDFium — Apache 2.0 / BSD-3-Clause
 pypdf — BSD-3-Clause; cryptography — Apache 2.0 / BSD (за криптирани PDF)
 python-docx — MIT
+openpyxl — MIT
 Pillow — MIT-CMU (HPND)
 NumPy — BSD-3-Clause
 pytesseract — Apache 2.0
