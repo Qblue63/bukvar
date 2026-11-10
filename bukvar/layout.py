@@ -227,7 +227,7 @@ def _cluster(values: list[float], tol: float) -> list[int]:
     return [int(round(sum(g) / len(g))) for g in groups]
 
 
-def _line_masks(gray: np.ndarray, colored: np.ndarray, dpi: int) -> tuple[np.ndarray, np.ndarray]:
+def _line_masks(gray: np.ndarray, colored: np.ndarray, dpi: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Хоризонтални и вертикални линии на таблици.
 
     Линиите често са тънки (1 px) и сиви, затова прагът е по-светъл от този
@@ -265,14 +265,16 @@ def _line_masks(gray: np.ndarray, colored: np.ndarray, dpi: int) -> tuple[np.nda
     v = keep[lab]
     # за самостоятелни линии (разделители) допускаме и дебели линии; те после
     # се проверяват за непрекъснатост
-    _line_masks.thick_h = directional((7, 1), (int(0.3 * dpi), 1), 0, max(8.0, 0.045 * dpi))[0]
-    return h, v
+    thick_h = directional((7, 1), (int(0.3 * dpi), 1), 0, max(8.0, 0.045 * dpi))[0]
+    # Всичко се връща като резултат: страниците се обработват паралелно и
+    # споделено място (напр. атрибут на функцията) би смесило данните им.
+    return h, v, thick_h
 
 
-def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[list[TableGrid], np.ndarray]:
+def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[list[TableGrid], np.ndarray, list]:
     """Намира таблици с линии. Връща таблиците и маската на линиите им."""
     H, W = gray.shape
-    hmask, vmask = _line_masks(gray, colored, dpi)
+    hmask, vmask, thick_h = _line_masks(gray, colored, dpi)
     lines = (hmask | vmask).astype(np.uint8)
     region = cv2.dilate(lines, np.ones((9, 9), np.uint8))
     n, lab, st, _ = cv2.connectedComponentsWithStats(region, 8)
@@ -382,7 +384,7 @@ def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[
     raw = (gray < 215) & ~colored
     rules = []
     rule_px = np.zeros(gray.shape, dtype=bool)
-    rn, rl, rst, _ = cv2.connectedComponentsWithStats((_line_masks.thick_h & ~used).astype(np.uint8), 8)
+    rn, rl, rst, _ = cv2.connectedComponentsWithStats((thick_h & ~used).astype(np.uint8), 8)
     for j in range(1, rn):
         x, y, w, h, _ = rst[j]
         if w < 0.3 * dpi:
@@ -425,8 +427,7 @@ def find_tables(gray: np.ndarray, colored: np.ndarray, dpi: int = 300) -> tuple[
                     rule_grown[t:b + 1, xx] = False
     line_mask |= rule_grown
     tables.sort(key=lambda t: (t.ys[0], t.xs[0]))
-    find_tables.last_rules = rules
-    return tables, line_mask
+    return tables, line_mask, rules
 
 
 def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = True,
@@ -447,8 +448,7 @@ def clean_for_ocr(img: Image.Image, dpi: int = 300, remove_handwriting: bool = T
     grids: list[TableGrid] = []
     rules: list = []
     if tables:
-        grids, line_mask = find_tables(gray, colored, dpi)
-        rules = find_tables.last_rules
+        grids, line_mask, rules = find_tables(gray, colored, dpi)
         out[line_mask] = 255           # линиите пречат на Tesseract
         dark = dark & ~line_mask
         ink = ink & ~line_mask

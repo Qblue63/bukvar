@@ -4,12 +4,13 @@ from __future__ import annotations
 import os
 import sys
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread, Signal, QUrl
-from PySide6.QtGui import (QAction, QDesktopServices, QFont, QIcon, QImage, QKeySequence,
-                           QPainter, QPixmap)
+from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QIcon,
+                           QImage, QKeySequence, QPainter, QPixmap)
 from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsPixmapItem, QGraphicsScene,
                                QGraphicsView, QLabel, QListWidget, QListWidgetItem, QMainWindow,
                                QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QSplitter,
@@ -37,33 +38,79 @@ def resource(name: str) -> Path:
 # Работа във фонов режим
 # --------------------------------------------------------------------------
 
-class OcrWorker(QObject):
-    page_done = Signal(int)
-    finished = Signal()
-    failed = Signal(str)
+class OcrQueue(QObject):
+    """Опашка за разпознаване: всяка страница е отделна задача, няколко
+    страници се разпознават едновременно. Страници могат да се добавят и
+    докато други се разпознават."""
+    page_started = Signal(int)
+    page_finished = Signal(int)
+    page_cancelled = Signal(int)
+    idle = Signal()
 
-    def __init__(self, pages, indexes, langs, auto_rotate, deskew, forms=True, tables=True):
+    def __init__(self, workers: int):
         super().__init__()
-        self.pages, self.indexes = pages, indexes
-        self.langs, self.auto_rotate, self.deskew, self.forms = langs, auto_rotate, deskew, forms
-        self.tables = tables
-        self._stop = threading.Event()
+        self.workers = workers
+        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ocr")
+        self._futures: dict[int, Future] = {}
+        self._lock = threading.Lock()
 
-    def stop(self) -> None:
-        self._stop.set()
+    def set_workers(self, n: int) -> None:
+        """Новият брой важи за следващите задачи (текущите довършват)."""
+        if n == self.workers:
+            return
+        self.workers = n
+        old = self._pool
+        self._pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="ocr")
+        if not self.busy():
+            old.shutdown(wait=False)
+        else:
+            self._old_pool = old   # затваря се, когато опашката се изпразни
 
-    def run(self) -> None:
-        try:
-            subset = [self.pages[i] for i in self.indexes]
-            for p in subset:
-                p.reset()
-            engine.process_pages(subset, self.langs, self.auto_rotate, self.deskew,
-                                 clean_forms=self.forms, detect_tables=self.tables,
-                                 on_page_done=lambda k: self.page_done.emit(self.indexes[k]),
-                                 should_stop=self._stop.is_set)
-        except Exception as exc:  # pragma: no cover - показва се на потребителя
-            self.failed.emit(str(exc))
-        self.finished.emit()
+    def busy(self) -> bool:
+        with self._lock:
+            return bool(self._futures)
+
+    def pending(self, i: int) -> bool:
+        with self._lock:
+            return i in self._futures
+
+    def submit(self, i: int, page, params: dict) -> bool:
+        with self._lock:
+            if i in self._futures:
+                return False      # вече е в опашката
+            fut = self._pool.submit(self._run, i, page, params)
+            self._futures[i] = fut
+        fut.add_done_callback(lambda f, i=i: self._finished(i, f))
+        return True
+
+    def _run(self, i: int, page, params: dict) -> None:
+        self.page_started.emit(i)
+        engine.process_page(page, **params)
+
+    def _finished(self, i: int, fut: Future) -> None:
+        with self._lock:
+            self._futures.pop(i, None)
+            empty = not self._futures
+        if fut.cancelled():
+            self.page_cancelled.emit(i)
+        else:
+            self.page_finished.emit(i)
+        if empty:
+            old = getattr(self, "_old_pool", None)
+            if old is not None:
+                old.shutdown(wait=False)
+                self._old_pool = None
+            self.idle.emit()
+
+    def cancel(self, indexes=None) -> int:
+        """Маха чакащите задачи (започналите довършват). Връща колко са махнати."""
+        with self._lock:
+            items = [(i, f) for i, f in self._futures.items() if indexes is None or i in indexes]
+        return sum(1 for _, f in items if f.cancel())
+
+    def shutdown(self) -> None:
+        self.cancel()
+        self._pool.shutdown(wait=True)
 
 
 class ThumbWorker(QObject):
@@ -144,8 +191,9 @@ class MainWindow(QMainWindow):
         self.pages: list[engine.Page] = []
         self.current = -1
         self._loading_text = False
-        self._ocr_thread: QThread | None = None
-        self._ocr_worker: OcrWorker | None = None
+        self._running: set[int] = set()     # страници, които се разпознават в момента
+        self._batch_total = 0
+        self._batch_done = 0
         self._thumb_threads: list[tuple[QThread, ThumbWorker]] = []
 
         self.setWindowTitle(APP_NAME)
@@ -156,6 +204,13 @@ class MainWindow(QMainWindow):
 
         exe, tessdata = engine.configure_tesseract()
         self.languages = engine.available_languages() if exe else []
+
+        workers = self.settings.value("workers", engine.default_workers(), type=int)
+        self.queue = OcrQueue(max(1, workers))
+        self.queue.page_started.connect(self._page_started)
+        self.queue.page_finished.connect(self._page_done)
+        self.queue.page_cancelled.connect(self._page_cancelled)
+        self.queue.idle.connect(self._ocr_finished)
 
         self._build_ui()
         self._build_toolbar()
@@ -178,6 +233,9 @@ class MainWindow(QMainWindow):
         self.page_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.page_list.setMinimumWidth(180)
         self.page_list.currentRowChanged.connect(self.show_page)
+        self.page_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.page_list.customContextMenuRequested.connect(self._page_menu)
+        self.page_list.setToolTip("Десен бутон върху страница — разпознаване само на нея")
 
         self.view = PageView()
 
@@ -224,6 +282,8 @@ class MainWindow(QMainWindow):
 
         self.act_ocr = QAction(st.standardIcon(st.StandardPixmap.SP_MediaPlay), "Разпознай", self)
         self.act_ocr.setShortcut("F5")
+        self.act_ocr.setToolTip("Разпознава избраните страници, а ако е избрана една — всички "
+                                "нерозпознати (F5).\nДесен бутон върху страница — само тя.")
         self.act_ocr.triggered.connect(self.recognize_all)
         tb.addAction(self.act_ocr)
 
@@ -273,6 +333,20 @@ class MainWindow(QMainWindow):
         self.opt_menu.addActions([self.act_rotate, self.act_deskew, self.act_forms, self.act_tables])
         self.opt_menu.addSeparator()
         self.opt_menu.addAction(self.act_format)
+        self.opt_menu.addSeparator()
+        workers_menu = self.opt_menu.addMenu("Едновременно страници")
+        group = QActionGroup(self)
+        cores = os.cpu_count() or 2
+        for n in sorted({1, 2, 3, 4, 6, 8, self.queue.workers}):
+            a = QAction(f"{n}" + ("  (препоръчително)" if n == engine.default_workers() else ""),
+                        self, checkable=True)
+            a.setChecked(n == self.queue.workers)
+            a.setToolTip(f"Компютърът има {cores} ядра. Повече страници едновременно "
+                         "искат и повече памет (~300 MB на страница).")
+            a.triggered.connect(lambda _=False, n=n: self._set_workers(n))
+            group.addAction(a)
+            workers_menu.addAction(a)
+        workers_menu.setToolTipsVisible(True)
         self.opt_menu.setToolTipsVisible(True)
         opt_btn = QToolButton()
         opt_btn.setText("Настройки")
@@ -378,12 +452,30 @@ class MainWindow(QMainWindow):
 
     def _item_label(self, i: int) -> str:
         p = self.pages[i]
-        mark = ""
-        if p.error:
-            mark = "  ✖"
+        if i in self._running:
+            mark = "  ⟳ разпознава се"
+        elif self.queue.pending(i):
+            mark = "  ⏳ в опашка"
+        elif p.error:
+            mark = "  ✖ грешка"
         elif p.done:
             mark = f"  ✔ {p.confidence:.0f}%" if p.confidence is not None else "  ✔"
+        else:
+            mark = ""
         return f"Стр. {i + 1}{mark}"
+
+    def _refresh_item(self, i: int) -> None:
+        item = self.page_list.item(i)
+        if item is None:
+            return
+        item.setText(self._item_label(i))
+        p = self.pages[i]
+        if p.error and i not in self._running and not self.queue.pending(i):
+            item.setForeground(QBrush(QColor(190, 30, 30)))
+            item.setToolTip(f"Грешка: {p.error}\nДесен бутон → „Разпознай отново“")
+        else:
+            item.setData(Qt.ForegroundRole, None)
+            item.setToolTip(p.label)
 
     def clear(self) -> None:
         if self._busy():
@@ -410,9 +502,13 @@ class MainWindow(QMainWindow):
             self.view.show_image(None)
             self.statusBar().showMessage(f"Грешка при показване: {exc}")
         self._set_editor_text(p.text)
-        self.editor.setReadOnly(not p.done)
+        self.editor.setReadOnly(not p.done or self.queue.pending(i))
         info = p.label
-        if p.error:
+        if i in self._running:
+            info += " — разпознава се…"
+        elif self.queue.pending(i):
+            info += " — в опашка"
+        elif p.error:
             info += f" — грешка: {p.error}"
         elif p.done:
             info += f" — разпознато, увереност {p.confidence or 0:.0f}%"
@@ -437,12 +533,29 @@ class MainWindow(QMainWindow):
     # ---------- разпознаване ----------
 
     def _busy(self) -> bool:
-        return self._ocr_thread is not None
+        return self.queue.busy()
+
+    def _selected_rows(self) -> list[int]:
+        return sorted({ix.row() for ix in self.page_list.selectedIndexes()})
 
     def recognize_all(self) -> None:
-        rows = sorted({ix.row() for ix in self.page_list.selectedIndexes()})
+        """F5: избраните страници; ако е избрана една — всички нерозпознати."""
+        rows = self._selected_rows()
         if len(rows) <= 1:
-            rows = list(range(len(self.pages)))
+            rows = [i for i, p in enumerate(self.pages) if not p.done and not self.queue.pending(i)]
+            if not rows:
+                if not self.pages or self._busy():
+                    return
+                if QMessageBox.question(self, APP_NAME, "Всички страници вече са разпознати. "
+                                        "Да се разпознаят ли отново?") != QMessageBox.Yes:
+                    return
+                rows = list(range(len(self.pages)))
+        self.recognize(rows)
+
+    def recognize(self, rows: list[int]) -> None:
+        rows = [i for i in rows if 0 <= i < len(self.pages) and not self.queue.pending(i)]
+        if not rows:
+            return
         if any(self.pages[i].text_edited for i in rows):
             if QMessageBox.question(self, APP_NAME, "Има ръчни поправки в текста. "
                                     "Повторното разпознаване ще ги изтрие. Продължаване?") != QMessageBox.Yes:
@@ -450,8 +563,6 @@ class MainWindow(QMainWindow):
         self.start_ocr(rows)
 
     def start_ocr(self, indexes: list[int]) -> None:
-        if self._busy() or not indexes:
-            return
         langs = self.selected_langs()
         if not langs:
             QMessageBox.information(self, APP_NAME, "Изберете поне един език.")
@@ -460,59 +571,126 @@ class MainWindow(QMainWindow):
         self.settings.setValue("deskew", self.act_deskew.isChecked())
         self.settings.setValue("forms", self.act_forms.isChecked())
         self.settings.setValue("tables", self.act_tables.isChecked())
-        self._done_count, self._total = 0, len(indexes)
-        self.progress.setRange(0, len(indexes))
-        self.progress.setValue(0)
+        params = dict(langs=langs, auto_rotate=self.act_rotate.isChecked(),
+                      deskew=self.act_deskew.isChecked(), clean_forms=self.act_forms.isChecked(),
+                      detect_tables=self.act_tables.isChecked())
+        if not self._busy():
+            self._batch_total = self._batch_done = 0
+        added = 0
+        for i in indexes:
+            if self.queue.submit(i, self.pages[i], params):
+                added += 1
+                self._refresh_item(i)
+        if not added:
+            return
+        self._batch_total += added
+        self.progress.setRange(0, self._batch_total)
+        self.progress.setValue(self._batch_done)
         self.progress.setVisible(True)
-        self.statusBar().showMessage("Разпознаване…")
-
-        self._ocr_thread = QThread(self)
-        self._ocr_worker = OcrWorker(self.pages, indexes, langs,
-                                     self.act_rotate.isChecked(), self.act_deskew.isChecked(),
-                                     self.act_forms.isChecked(), self.act_tables.isChecked())
-        self._ocr_worker.moveToThread(self._ocr_thread)
-        self._ocr_thread.started.connect(self._ocr_worker.run)
-        self._ocr_worker.page_done.connect(self._page_done)
-        self._ocr_worker.failed.connect(lambda m: QMessageBox.critical(self, APP_NAME, m))
-        self._ocr_worker.finished.connect(self._ocr_finished)
-        self._ocr_thread.start()
+        self._status_running()
+        if self.current in indexes:
+            self.show_page(self.current)
         self._update_actions()
 
+    def _status_running(self) -> None:
+        self.statusBar().showMessage(
+            f"Разпознаване… {self._batch_done} от {self._batch_total} "
+            f"(едновременно: {self.queue.workers})")
+
+    def _page_started(self, i: int) -> None:
+        self._running.add(i)
+        self._refresh_item(i)
+        if i == self.current:
+            self.show_page(i)
+
     def _page_done(self, i: int) -> None:
-        self._done_count += 1
-        self.progress.setValue(self._done_count)
-        self.page_list.item(i).setText(self._item_label(i))
-        self.statusBar().showMessage(f"Разпознаване… {self._done_count} от {self._total}")
+        self._running.discard(i)
+        self._batch_done += 1
+        self.progress.setValue(self._batch_done)
+        self._refresh_item(i)
+        self._status_running()
+        if i == self.current:
+            self.show_page(i)
+        self._update_actions()
+
+    def _page_cancelled(self, i: int) -> None:
+        self._running.discard(i)
+        self._batch_total = max(self._batch_done, self._batch_total - 1)
+        self.progress.setRange(0, max(1, self._batch_total))
+        self._refresh_item(i)
         if i == self.current:
             self.show_page(i)
 
     def _ocr_finished(self) -> None:
-        self._ocr_thread.quit()
-        self._ocr_thread.wait()
-        self._ocr_thread = None
-        self._ocr_worker = None
         self.progress.setVisible(False)
         errors = sum(1 for p in self.pages if p.error)
-        msg = f"Готово: {self._done_count} страници"
+        msg = f"Готово: {self._batch_done} страници"
         if errors:
-            msg += f", {errors} с грешка"
+            msg += f", {errors} с грешка — десен бутон → „Разпознай отново неуспешните“"
         self.statusBar().showMessage(msg)
         if 0 <= self.current < len(self.pages):
             self.show_page(self.current)
         self._update_actions()
 
     def stop_ocr(self) -> None:
-        if self._ocr_worker:
-            self._ocr_worker.stop()
-            self.statusBar().showMessage("Спиране след текущите страници…")
+        n = self.queue.cancel()
+        if self._running:
+            self.statusBar().showMessage(f"Махнати от опашката: {n}. "
+                                         "Започналите страници се довършват…")
+
+    def _set_workers(self, n: int) -> None:
+        self.queue.set_workers(n)
+        self.settings.setValue("workers", n)
+        if self._busy():
+            self.statusBar().showMessage(f"Едновременно страници: {n} (за следващите в опашката)")
+
+    def _page_menu(self, pos) -> None:
+        item = self.page_list.itemAt(pos)
+        if item is not None and not item.isSelected():
+            self.page_list.setCurrentItem(item)       # десен бутон избира страницата
+        rows = self._selected_rows()
+        menu = QMenu(self)
+        if rows:
+            label = (f"Разпознай страница {rows[0] + 1}" if len(rows) == 1
+                     else f"Разпознай избраните страници ({len(rows)})")
+            if all(self.pages[i].done or self.pages[i].error for i in rows):
+                label = label.replace("Разпознай", "Разпознай отново")
+            a = menu.addAction(label, lambda: self.recognize(rows))
+            a.setEnabled(any(not self.queue.pending(i) for i in rows) and bool(self.selected_langs()))
+            menu.setDefaultAction(a)
+        todo = [i for i, p in enumerate(self.pages) if not p.done and not p.error and not self.queue.pending(i)]
+        failed = [i for i, p in enumerate(self.pages) if p.error and not self.queue.pending(i)]
+        free = [i for i in range(len(self.pages)) if not self.queue.pending(i)]
+        menu.addAction(f"Разпознай нерозпознатите ({len(todo)})", lambda: self.recognize(todo)).setEnabled(bool(todo))
+        if failed:
+            menu.addAction(f"Разпознай отново неуспешните ({len(failed)})", lambda: self.recognize(failed))
+        menu.addAction("Разпознай всички страници", lambda: self.recognize(free)).setEnabled(bool(free))
+        queued = [i for i in rows if self.queue.pending(i) and i not in self._running]
+        if queued:
+            menu.addSeparator()
+            menu.addAction("Махни от опашката", lambda: self.queue.cancel(set(queued)))
+        done_rows = [i for i in rows if self.pages[i].done]
+        if done_rows:
+            menu.addSeparator()
+            sub = menu.addMenu("Запиши " + ("страницата" if len(done_rows) == 1 else f"избраните ({len(done_rows)})"))
+            sub.addAction("Търсим PDF…", lambda: self.save(".pdf", done_rows))
+            sub.addAction("Word документ (DOCX)…", lambda: self.save(".docx", done_rows))
+            sub.addAction("Таблиците в Excel (XLSX)…", lambda: self.save(".xlsx", done_rows))
+            sub.addAction("Текстов файл (TXT)…", lambda: self.save(".txt", done_rows))
+            menu.addAction("Копирай текста", lambda: QApplication.clipboard().setText(
+                "\n\n".join(self.pages[i].text for i in done_rows)))
+        menu.exec(self.page_list.viewport().mapToGlobal(pos))
 
     # ---------- запис ----------
 
-    def save(self, ext: str) -> None:
-        done = [p for p in self.pages if p.done]
+    def save(self, ext: str, rows: list[int] | None = None) -> None:
+        if rows is not None:
+            done = [self.pages[i] for i in rows if self.pages[i].done]
+        else:
+            done = [p for p in self.pages if p.done]
         if not done:
             return
-        if len(done) < len(self.pages):
+        if rows is None and len(done) < len(self.pages):
             if QMessageBox.question(self, APP_NAME, f"Разпознати са {len(done)} от {len(self.pages)} страници. "
                                     "Да се запишат само разпознатите?") != QMessageBox.Yes:
                 return
@@ -520,7 +698,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "Ръчните поправки се записват в DOCX и TXT. "
                                     "В PDF невидимият текстов слой остава от разпознаването.")
         default_dir = Path(self.settings.value("save_dir", str(done[0].source.parent)))
-        default = default_dir / f"{done[0].source.stem}.ocr{ext}"
+        suffix = ""
+        if rows is not None and len(done) == 1:
+            suffix = f".стр{done[0].index + 1}"
+        default = default_dir / f"{done[0].source.stem}{suffix}.ocr{ext}"
         names = {".pdf": "PDF (*.pdf)", ".docx": "Word (*.docx)", ".xlsx": "Excel (*.xlsx)",
                  ".txt": "Текст (*.txt)"}
         path, _ = QFileDialog.getSaveFileName(self, "Запис", str(default), names[ext])
@@ -558,8 +739,8 @@ class MainWindow(QMainWindow):
         busy = self._busy()
         has = bool(self.pages)
         any_done = any(p.done for p in self.pages)
-        self.act_open.setEnabled(not busy)
-        self.act_ocr.setEnabled(has and not busy and bool(self.selected_langs()))
+        self.act_open.setEnabled(True)            # може да се добавят файлове и по време на работа
+        self.act_ocr.setEnabled(has and bool(self.selected_langs()))
         self.act_stop.setEnabled(busy)
         self.save_button.setEnabled(any_done and not busy)
         self.act_copy.setEnabled(any_done)
@@ -585,14 +766,14 @@ class MainWindow(QMainWindow):
                 files += sorted(str(f) for f in p.iterdir() if f.suffix.lower() in engine.SUPPORTED_EXTS)
             elif p.suffix.lower() in engine.SUPPORTED_EXTS:
                 files.append(str(p))
-        if files and not self._busy():
+        if files:
             self.add_files(files)
 
     def closeEvent(self, ev):
         if self._busy():
-            self.stop_ocr()
-            self._ocr_thread.quit()
-            self._ocr_thread.wait(10000)
+            self.statusBar().showMessage("Довършване на започналите страници…")
+            QApplication.processEvents()
+        self.queue.shutdown()
         for thread, worker in self._thumb_threads:
             worker._stop.set()
             try:

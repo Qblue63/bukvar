@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -170,11 +170,15 @@ _TMP_DIR: Path | None = None
 _pdfium_lock = threading.Lock()   # pdfium не е безопасен при паралелни нишки
 
 
+_tmp_lock = threading.Lock()
+
+
 def _tmp_dir() -> Path:
     global _TMP_DIR
-    if _TMP_DIR is None:
-        _TMP_DIR = Path(tempfile.mkdtemp(prefix="bukvar_"))
-        atexit.register(shutil.rmtree, _TMP_DIR, True)
+    with _tmp_lock:
+        if _TMP_DIR is None:
+            _TMP_DIR = Path(tempfile.mkdtemp(prefix="bukvar_"))
+            atexit.register(shutil.rmtree, _TMP_DIR, True)
     return _TMP_DIR
 
 
@@ -1202,30 +1206,47 @@ def ocr_page(page: Page, langs: str, img: Image.Image | None = None,
     page.done = True
 
 
+def default_workers() -> int:
+    """Колко страници едновременно: поне 2, но не повече от ядрата (до 4).
+
+    Tesseract работи с една нишка на страница, затова паралелните страници
+    са най-добрият начин да се използват всички ядра."""
+    return min(4, max(2, os.cpu_count() or 2))
+
+
+def process_page(page: Page, langs: str, auto_rotate: bool = True, deskew: bool = True,
+                 clean_forms: bool = True, detect_tables: bool = True) -> None:
+    """Разпознава една страница. Грешката се записва в page.error, не се хвърля."""
+    page.reset()
+    try:
+        img = preprocess(page, auto_rotate, deskew)
+        ocr_page(page, langs, img, clean_forms, detect_tables)
+        page.error = None
+    except Exception as exc:  # една лоша страница не спира останалите
+        page.error = str(exc) or exc.__class__.__name__
+        page.done = False
+
+
 def process_pages(pages: list[Page], langs: str, auto_rotate: bool = True,
                   deskew: bool = True, workers: int | None = None,
                   clean_forms: bool = True, detect_tables: bool = True,
                   on_page_done: Callable[[int], None] | None = None,
                   should_stop: Callable[[], bool] | None = None) -> None:
-    """Обработва страниците паралелно. on_page_done(i) се вика за всяка готова."""
-    workers = workers or max(1, min(len(pages), (os.cpu_count() or 2) - 1))
+    """Обработва страниците паралелно. on_page_done(i) се вика за всяка готова,
+    в реда, в който завършват."""
+    workers = workers or min(len(pages), default_workers()) or 1
 
     def job(i: int) -> int:
         if should_stop and should_stop():
-            return i
-        try:
-            img = preprocess(pages[i], auto_rotate, deskew)
-            ocr_page(pages[i], langs, img, clean_forms, detect_tables)
-            pages[i].error = None
-        except Exception as exc:  # една лоша страница не спира останалите
-            pages[i].error = str(exc)
+            return -1
+        process_page(pages[i], langs, auto_rotate, deskew, clean_forms, detect_tables)
         return i
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(job, i) for i in range(len(pages))]
-        for f in futures:
+        for f in as_completed(futures):
             i = f.result()
-            if on_page_done and (pages[i].done or pages[i].error):
+            if i >= 0 and on_page_done:
                 on_page_done(i)
 
 
